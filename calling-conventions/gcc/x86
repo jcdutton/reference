@@ -1,0 +1,6 @@
+32bit
+fastcall with gcc: ecx, edx
+
+64bit
+fastcall with gcc: rdi, rsi, rdx, rcx, r8, r9, xmm0-7
+
