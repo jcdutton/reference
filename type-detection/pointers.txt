@@ -1,0 +1,20 @@
+P1,P2 are pointers
+I1,I2 are integers
+
+P1 + P2 = Invalid
+P1 - P2 = Integer
+P1 * P2 = Invalid
+P1 / P2 = Invalid
+
+P1 + I1 = Pointer
+P1 - I1 = Pointer
+P1 * I1 = Invalid
+P1 / I1 = Invalid
+
+I1 + I2 = Integer
+I1 - I2 = Integer
+I1 * I2 = Integer
+I1 / I2 = Integer
+
+
+
