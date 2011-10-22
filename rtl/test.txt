@@ -1,0 +1,13 @@
+Pseudo code for the TEST instruction.
+
+TEMP = SRC1 AND SRC2;
+SF = MSB(TEMP);
+IF TEMP = 0
+	ZF = 1;
+ELSE
+	ZF = 0;
+FI;
+PF = BitwiseXNOR(TEMP[0:7]);
+CF = 0;
+OF = 0;
+(* AF is undefined *)
