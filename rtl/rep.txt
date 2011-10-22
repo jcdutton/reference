@@ -1,0 +1,33 @@
+The REP prefix.
+
+A variable repz and repnz will be either 1 or 0.
+Any decoded instruction can use that variable to decide how to craft the RTL.
+
+E.g. in amd64 att format:
+rep movs rsi, rdi;
+The RTL for this will be:
+begin:
+cmp ecx, 0;
+jz next_instruction;
+mov rsi, rdi;
+add 4, rsi;
+add 4, rdi;
+jmp begin;
+next_instruction:
+
+rep cmps rsi, rdi;
+The RTL for this will be:
+begin:
+repz cmp ecx, 0;
+jz next_instruction;
+cmp rsi, rdi;
+jz next_instruction;
+add 4, rsi;
+add 4, rdi;
+jmp begin;
+next_instruction:
+
+The above code arrangement has the advantage that all jz and jmp instructions are to amd64 intruction boundarys and none are to specific rtl instructions. I.e. No Jumps to the middle of a set of rtl instructions decoded from a single amd64 instruction.
+
+
+
