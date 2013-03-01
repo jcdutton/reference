@@ -17,4 +17,9 @@ I1 * I2 = Integer
 I1 / I2 = Integer
 
 
+1) A variable is a pointer if it is used to load/store another variable in memory.
+2) Signed/Unsigned integer can be determined from branch statements and other hints.
+3) Integer or String can be determined depending on how it is used.
+E.g. If it is used as the format variable in a printf() it is a string.
+If it is used in the variable args of a printf() statement and the format string identifies it as %s is it a string.
 
