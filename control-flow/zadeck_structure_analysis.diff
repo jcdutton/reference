@@ -1,0 +1,4276 @@
+Index: Makefile.in
+===================================================================
+RCS file: /cvs/gcc/gcc/gcc/Makefile.in,v
+retrieving revision 1.1543
+diff -u -p -r1.1543 Makefile.in
+--- Makefile.in	28 Sep 2005 23:49:58 -0000	1.1543
++++ Makefile.in	29 Sep 2005 22:15:42 -0000
+@@ -2339,6 +2339,9 @@ local-alloc.o : local-alloc.c $(CONFIG_H
+    $(RTL_H) $(FLAGS_H) $(REGS_H) hard-reg-set.h insn-config.h $(RECOG_H) \
+    output.h function.h $(INSN_ATTR_H) toplev.h  except.h reload.h $(TM_P_H) \
+    $(GGC_H) $(INTEGRATE_H) timevar.h tree-pass.h
++regions.o : regions.c $(CONFIG_H) $(SYSTEM_H)  coretypes.h $(TM_H) $(RTL_H) \
++   $(CFGLOOP_H) $(BASIC_BLOCK_H) $(REGS_H) $(TM_H) $(RTL_H) \
++   bitmap.h $(DF_H)
+ bitmap.o : bitmap.c $(CONFIG_H) $(SYSTEM_H)  coretypes.h $(TM_H) $(RTL_H) \
+    $(FLAGS_H) $(GGC_H) gt-bitmap.h bitmap.h $(OBSTACK_H)
+ global.o : global.c $(CONFIG_H) $(SYSTEM_H) coretypes.h $(TM_H) $(RTL_H) \
+Index: basic-block.h
+===================================================================
+RCS file: /cvs/gcc/gcc/gcc/basic-block.h,v
+retrieving revision 1.269
+diff -u -p -r1.269 basic-block.h
+--- basic-block.h	11 Jul 2005 13:31:41 -0000	1.269
++++ basic-block.h	29 Sep 2005 22:15:42 -0000
+@@ -185,6 +185,165 @@ struct loops;
+ struct edge_prediction;
+ struct rtl_bb_info;
+ 
++/* Control flow analysis information.  */
++
++enum region_type {
++  SINGLE_NODE_REGION,  /* Regular basic block.  */
++  ROOT_REGION,         /* Entry region.  */
++
++  IMPROPER_REGION,     /* Various loops.  */
++  REDUCED_LOOP_REGION, /* Generic reducible loop.  */
++
++  BLOCK_REGION,        /* Sequence of blocks.  */
++
++  IF_EXIT_ELSE_REGION, /* Condition where one branch exits */
++  IF_THEN_EXIT_REGION, /* enclosing loop or root.  */
++  BRANCH2_EXIT_REGION, 
++
++  IF_THEN_ELSE_REGION, /* Standard conditional branch diamonds.  */
++  DIAMOND_REGION,
++  
++  COMPLEX_CASE_REGION, /* Complex cases for switch.  */
++  SWITCH_REGION        /* Switch region.  */
++};
++
++/* IMPROPER_REGION has a set of entry and exit nodes. */
++struct improper_region_s {
++  /* The real entries to the region.  */
++  int entry_count;
++  struct basic_block_def **entries;
++};
++  
++/* For the IF_* regions, one of the arms corresponds EDGE_TRUE_VALUE
++   and the other to the edge with EDGE_FALSE_VALUE.  BRANCH2 and
++   DIAMOND are used when we do not have that kind of information. 
++   For the next 5 types, the conditional is the entry node of the region.
++ */
++
++/* The next three regions are for conditional branches where one of
++   the arms exits the current loop or returns and the other arm
++   remains within the loop. */
++struct if_exit_else_region_s {
++  struct basic_block_def *exit_region;
++  struct basic_block_def *else_region;
++  int num_loops_exited;
++};
++
++struct if_then_exit_region_s {
++  struct basic_block_def *then_region;
++  struct basic_block_def *exit_region;
++  int num_loops_exited;
++};
++
++struct branch2_exit_region_s {
++  struct basic_block_def *local_region;
++  struct basic_block_def *exit_region;
++  int num_loops_exited;
++};
++
++/* The next two regions are diamond shaped.  */
++
++struct if_then_else_region_s {
++  struct basic_block_def *then_region;
++  struct basic_block_def *else_region;
++};
++
++/* This is the same as an IF_THEN_ELSE region but is created when the
++   cfg edges are not marked (as in the rtl part of the
++   compiler). There are other cases that will also not have a marking.
++   A common example will be if the condition is not a simple node, but
++   a two exit loop. If the two exits happen to join back together, a
++   diamond region will be formed.
++ */
++
++struct diamond_region_s {
++  struct basic_block_def *first_region;
++  struct basic_block_def *second_region;
++};
++
++/* The COMPLEX_CASE_REGION is generated when the case has been broken
++   into two pieces.  There are three reasons why this might happen:
++
++   1) This case has the previous case drop into it.  When this
++   happens, critical edge splitting will insert a empty block between
++   the conditional and the code for the case.  The empty block will be
++   the only entry in the vector ENTRY_CASES the FIRST_REGION and the
++   original case will be the CASE_REGION.  The PREVIOUS_CASE is set to
++   point to the region that falls into this case.
++
++   2) This case has a group of labels that point to it.  In this case,
++   the critical edge splitting will also insert extra empty blocks
++   between the conditional and the CASE_REGION.  All of those empty
++   blocks are gathered into a ENTRY_CASES vector.  The PREVIOUS_CASE
++   will be NULL if there is no drop in.
++
++   3) Both (1) and (2) happen for this case.  When that happens, the
++   ENTRY_CASES will have more than one element and the PREVIOUS_CASE
++   will be not NULL.  */
++struct complex_case_region_s {
++  struct basic_block_def *previous_region;
++  unsigned int entry_case_count; 
++  struct basic_block_def ** entry_cases; 
++  struct basic_block_def *case_region;
++};
++
++struct switch_region_s {
++  struct basic_block_def *condition;
++  unsigned int case_count;
++
++  /* The regular and return cases are vectors of vectors of arms.
++     Each inner vector contain one list of cases that all drop thru to
++     the next.  The last one being the one with the break.  To support
++     this, there is a vector of ints that say how many arms are in the
++     vec.*/ 
++  unsigned int regular_case_count_count; 
++  unsigned int *regular_case_counts; 
++  struct basic_block_def *** regular_cases; 
++
++  unsigned int return_case_count_count; 
++  unsigned int *return_case_counts; 
++  struct basic_block_def *** return_cases;
++
++  /* For cases that loop exit, there is not enough structure to see if
++     any of them dropped down since all of these are technically
++     outside of the loop being analyzed.  */
++  unsigned int exit_case_count; 
++  struct basic_block_def ** exit_cases; 
++};
++
++typedef union region_details_u_a {
++  struct improper_region_s improper_region;
++
++  struct if_exit_else_region_s if_exit_else_region;
++  struct if_then_exit_region_s if_then_exit_region;
++  struct branch2_exit_region_s branch2_exit_region;
++
++  struct if_then_else_region_s if_then_else_region;
++  struct diamond_region_s diamond_region;
++
++  struct complex_case_region_s complex_case_region;
++  struct switch_region_s switch_region;
++} region_details_u;
++
++/* This structure is allocated for all non regular basic blocks.  */
++struct basic_block_region_def GTY(())
++{
++  enum region_type type;
++  struct basic_block_def *region_head;
++  struct basic_block_def *first_bb_in_region;
++  struct basic_block_def *last_bb_in_region;
++
++  /* The set of basic blocks in this region AND in all of the regions
++     with this region.  */
++  bitmap basic_blocks_in_region;
++  /* The set of regions in this region AND in all of the regions with
++     this region.  */
++  bitmap regions_in_region;
++  union region_details_u_a *GTY ((skip)) region_details;
++};
++
++typedef struct basic_block_region_def *basic_block_region;
++
+ /* A basic block is a sequence of instructions with only entry and
+    only one exit.  If any one of the instructions are executed, they
+    will all be executed, and in sequence from first to last.
+@@ -211,7 +370,7 @@ struct rtl_bb_info;
+    basic blocks.  */
+ 
+ /* Basic block information indexed by block number.  */
+-struct basic_block_def GTY((chain_next ("%h.next_bb"), chain_prev ("%h.prev_bb")))
++struct basic_block_def GTY(())
+ {
+   /* Pointers to the first and last trees of the block.  */
+   tree stmt_list;
+@@ -233,6 +392,22 @@ struct basic_block_def GTY((chain_next (
+   struct basic_block_def *prev_bb;
+   struct basic_block_def *next_bb;
+ 
++  /* Parent, previous and next blocks in the current region chain.  */
++  struct basic_block_def *parent_region;
++  struct basic_block_def *prev_bb_in_region;
++  struct basic_block_def *next_bb_in_region;
++
++  /* Preds and succs in the region graph. */
++  int num_region_preds;
++  int num_region_succs;
++  struct basic_block_def ** GTY ((skip (""))) region_preds;
++  struct basic_block_def ** GTY ((skip (""))) region_succs;
++
++  /* This field is null if this is a regular basic block.  If this
++     basic_block is a region node, then this is a pointer to the
++     region information.  */
++  struct basic_block_region_def *region_info;
++
+   union basic_block_il_dependent {
+       struct rtl_bb_info * GTY ((tag ("1"))) rtl;
+     } GTY ((desc ("((%1.flags & BB_RTL) != 0)"))) il;
+@@ -246,7 +421,8 @@ struct basic_block_def GTY((chain_next (
+   /* Expected number of executions: calculated in profile.c.  */
+   gcov_type count;
+ 
+-  /* The index of this block.  */
++  /* The index of this block.  ENTRY_BLOCK=0, EXIT_BLOCK=1, all other
++     regular blocks >1, all regions nodes <0. */
+   int index;
+ 
+   /* The loop depth of this block.  */
+@@ -362,9 +538,15 @@ struct control_flow_graph GTY(())
+   basic_block x_entry_block_ptr;
+   basic_block x_exit_block_ptr;
+ 
++  /* The entry node of the structure graph if it exists.  */
++  basic_block x_root_block_ptr;
++
+   /* Index by basic block number, get basic block struct info.  */
+   varray_type x_basic_block_info;
+ 
++  /* Number of region nodes in the structure graph.  */
++  int x_n_region_blocks;
++
+   /* Number of basic blocks in this flow graph.  */
+   int x_n_basic_blocks;
+ 
+@@ -388,8 +570,10 @@ struct control_flow_graph GTY(())
+ /* Defines for accessing the fields of the CFG structure for function FN.  */
+ #define ENTRY_BLOCK_PTR_FOR_FUNCTION(FN)     ((FN)->cfg->x_entry_block_ptr)
+ #define EXIT_BLOCK_PTR_FOR_FUNCTION(FN)	     ((FN)->cfg->x_exit_block_ptr)
++#define ROOT_BLOCK_PTR_FOR_FUNCTION(FN)	     ((FN)->cfg->x_root_block_ptr)
+ #define basic_block_info_for_function(FN)    ((FN)->cfg->x_basic_block_info)
+ #define n_basic_blocks_for_function(FN)	     ((FN)->cfg->x_n_basic_blocks)
++#define n_region_blocks_for_function(FN)     ((FN)->cfg->x_n_region_blocks)
+ #define n_edges_for_function(FN)	     ((FN)->cfg->x_n_edges)
+ #define last_basic_block_for_function(FN)    ((FN)->cfg->x_last_basic_block)
+ #define label_to_block_map_for_function(FN)  ((FN)->cfg->x_label_to_block_map)
+@@ -400,8 +584,10 @@ struct control_flow_graph GTY(())
+ /* Defines for textual backward source compatibility.  */
+ #define ENTRY_BLOCK_PTR		(cfun->cfg->x_entry_block_ptr)
+ #define EXIT_BLOCK_PTR		(cfun->cfg->x_exit_block_ptr)
++#define ROOT_BLOCK_PTR		(cfun->cfg->x_root_block_ptr)
+ #define basic_block_info	(cfun->cfg->x_basic_block_info)
+ #define n_basic_blocks		(cfun->cfg->x_n_basic_blocks)
++#define n_region_blocks		(cfun->cfg->x_n_region_blocks)
+ #define n_edges			(cfun->cfg->x_n_edges)
+ #define last_basic_block	(cfun->cfg->x_last_basic_block)
+ #define label_to_block_map	(cfun->cfg->x_label_to_block_map)
+@@ -427,17 +613,36 @@ extern bool rediscover_loops_after_threa
+ 
+ #define FOR_EACH_BB_REVERSE(BB) FOR_EACH_BB_REVERSE_FN(BB, cfun)
+ 
++#define FOR_EACH_BB_IN_REGION(BB, REGION) \
++  for (BB= (REGION)->region_info->first_bb_in_region; BB; BB = BB->next_bb_in_region)
++
++#define FOR_EACH_BB_REVERSE_IN_REGION(BB, REGION) \
++  for (BB= (REGION)->region_info->last_bb_in_region; BB; BB = BB->prev_bb_in_region)
++
+ /* For iterating over insns in basic block.  */
+ #define FOR_BB_INSNS(BB, INSN)			\
+   for ((INSN) = BB_HEAD (BB);			\
+-       (INSN) != NEXT_INSN (BB_END (BB));	\
++       (INSN) && (INSN) != NEXT_INSN (BB_END (BB));	\
+        (INSN) = NEXT_INSN (INSN))
+ 
++/* For iterating over insns in basic block when we might remove the
++   current insn.  */
++#define FOR_BB_INSNS_SAFE(BB, INSN, CURR)			\
++  for ((INSN) = BB_HEAD (BB), (CURR)=(INSN) ? NEXT_INSN ((INSN)): NULL;	\
++       (INSN) && (INSN) != NEXT_INSN (BB_END (BB));	\
++       (INSN) = (CURR), (CURR) = (INSN) ? NEXT_INSN ((INSN)) : NULL)
++       
++
+ #define FOR_BB_INSNS_REVERSE(BB, INSN)		\
+   for ((INSN) = BB_END (BB);			\
+-       (INSN) != PREV_INSN (BB_HEAD (BB));	\
++       (INSN) && (INSN) != PREV_INSN (BB_HEAD (BB));	\
+        (INSN) = PREV_INSN (INSN))
+ 
++#define FOR_BB_INSNS_REVERSE_SAFE(BB, INSN, CURR)	\
++  for ((INSN) = BB_END (BB),(CURR)=(INSN) ? PREV_INSN ((INSN)) : NULL;	\
++       (INSN) && (INSN) != PREV_INSN (BB_HEAD (BB));	\
++       (INSN) = (CURR), (CURR) = (INSN) ? PREV_INSN ((INSN)) : NULL)
++
+ /* Cycles through _all_ basic blocks, even the fake ones (entry and
+    exit block).  */
+ 
+@@ -467,11 +672,12 @@ extern bitmap_obstack reg_obstack;
+ #define BB_END(B)       (B)->il.rtl->end_
+ 
+ /* Special block numbers [markers] for entry and exit.  */
+-#define ENTRY_BLOCK (-1)
+-#define EXIT_BLOCK (-2)
++#define ENTRY_BLOCK (0)
++#define EXIT_BLOCK (1)
++
++/* The two blocks that are always in the cfg.  */
++#define NUM_FIXED_BLOCKS (2)
+ 
+-/* Special block number not valid for any block.  */
+-#define INVALID_BLOCK (-3)
+ 
+ #define BLOCK_NUM(INSN)	      (BLOCK_FOR_INSN (INSN)->index + 0)
+ #define set_block_for_insn(INSN, BB)  (BLOCK_FOR_INSN (INSN) = BB)
+@@ -989,6 +1195,24 @@ extern basic_block get_bb_original (basi
+ extern void set_bb_copy (basic_block, basic_block);
+ extern basic_block get_bb_copy (basic_block);
+ 
++
++/* In regions.c.  */
++extern void create_regions (bool);
++extern void delete_regions (void);
++extern int split_blocks_for_regions (void);
++extern enum region_type get_region_type (basic_block); 
++extern const char * get_region_type_name (enum region_type); 
++extern void dump_structure_graph (void);
++extern void debug_region_bb (basic_block); 
++extern bool single_block_region_p (basic_block);
++extern bool loop_region_p (basic_block);
++extern bool single_entry_region_p (basic_block);
++extern bool single_exit_region_p (basic_block);
++extern bool get_real_entry_blocks (basic_block, bitmap, bitmap);
++extern bool get_real_exit_blocks (basic_block, bitmap, bitmap);
++extern void get_real_blocks (basic_block, bitmap);
++
++
+ #include "cfghooks.h"
+ 
+ #endif /* GCC_BASIC_BLOCK_H */
+Index: cfghooks.c
+===================================================================
+RCS file: /cvs/gcc/gcc/gcc/cfghooks.c,v
+retrieving revision 1.32
+diff -u -p -r1.32 cfghooks.c
+--- cfghooks.c	24 Aug 2005 07:56:51 -0000	1.32
++++ cfghooks.c	29 Sep 2005 22:15:45 -0000
+@@ -888,3 +888,22 @@ lv_add_condition_to_bb (basic_block firs
+   gcc_assert (cfg_hooks->lv_add_condition_to_bb);
+   cfg_hooks->lv_add_condition_to_bb (first, second, new, cond);
+ }  
++
++
++/* Return true if BB contains only labels or non-executable
++   instructions */
++bool
++block_empty_p (basic_block bb)
++{
++  gcc_assert (cfg_hooks->block_empty_p);
++  return cfg_hooks->block_empty_p (bb);
++}
++
++/* Split a basic block if it ends with a conditional branch and if
++   the other part of the block is not empty.  */
++basic_block
++split_block_before_cond_jump (basic_block bb)
++{
++  gcc_assert (cfg_hooks->split_block_before_cond_jump);
++  return cfg_hooks->split_block_before_cond_jump (bb);
++}
+Index: cfghooks.h
+===================================================================
+RCS file: /cvs/gcc/gcc/gcc/cfghooks.h,v
+retrieving revision 1.18
+diff -u -p -r1.18 cfghooks.h
+--- cfghooks.h	24 Aug 2005 07:56:52 -0000	1.18
++++ cfghooks.h	29 Sep 2005 22:15:45 -0000
+@@ -135,6 +135,13 @@ struct cfg_hooks
+   /* Add PHI arguments queued in PENDINT_STMT list on edge E to edge
+      E->dest (only in tree-ssa loop versioning.  */
+   void (*flush_pending_stmts) (edge);
++  
++  /* True if a block contains no executable instructions.  */
++  bool (*block_empty_p) (basic_block);
++  
++  /* Split a basic block if it ends with a conditional branch and if
++     the other part of the block is not empty.  */
++  basic_block (*split_block_before_cond_jump) (basic_block);
+ };
+ 
+ extern void verify_flow_info (void);
+@@ -160,6 +167,8 @@ extern bool can_duplicate_block_p (basic
+ extern basic_block duplicate_block (basic_block, edge, basic_block);
+ extern bool block_ends_with_call_p (basic_block bb);
+ extern bool block_ends_with_condjump_p (basic_block bb);
++extern bool block_empty_p (basic_block);
++extern basic_block split_block_before_cond_jump (basic_block);
+ extern int flow_call_edges_add (sbitmap);
+ extern void execute_on_growing_pred (edge);
+ extern void execute_on_shrinking_pred (edge);
+Index: cfgrtl.c
+===================================================================
+RCS file: /cvs/gcc/gcc/gcc/cfgrtl.c,v
+retrieving revision 1.181
+diff -u -p -r1.181 cfgrtl.c
+--- cfgrtl.c	28 Jul 2005 21:11:30 -0000	1.181
++++ cfgrtl.c	29 Sep 2005 22:15:46 -0000
+@@ -82,6 +82,51 @@ static int rtl_verify_flow_info_1 (void)
+ static void mark_killed_regs (rtx, rtx, void *);
+ static void rtl_make_forwarder_block (edge);
+ 
++
++/* Return true if BB contains only labels or non-executable
++   instructions */ // STEVEN: Need DEBUG_INSN updating
++
++static bool
++rtl_block_empty_p (basic_block bb)
++{
++  rtx insn;
++  if (BB_HEAD (bb))
++    FOR_BB_INSNS (bb, insn)
++      {
++	if (!NOTE_P (insn) && !any_uncondjump_p (insn))
++	  return false;
++      }
++  return true;
++}
++
++/* Split a basic block if it ends with a conditional branch and if
++   the other part of the block is not empty.  */ // STEVEN: Need DEBUG_INSN updating
++
++static basic_block
++rtl_split_block_before_cond_jump (basic_block bb)
++{
++  rtx insn;
++  rtx split_point = NULL;
++  rtx last = NULL;
++  bool found_code = false;
++
++  if (BB_HEAD (bb))
++    FOR_BB_INSNS (bb, insn)
++      {
++	if (any_condjump_p (insn))
++	  split_point = last;
++	else if (!NOTE_P (insn) && !LABEL_P (insn))
++	  found_code = true;
++	last = insn;
++      }
++
++  /* Did not find everything.  */ 
++  if (found_code && split_point)
++    return split_block (bb, split_point)->dest;
++  else 
++    return NULL;
++}
++
+ /* Return true if NOTE is not one of the ones that must be kept paired,
+    so that we may simply delete it.  */
+ 
+@@ -3119,7 +3244,9 @@ struct cfg_hooks rtl_cfg_hooks = {
+   NULL, /* lv_add_condition_to_bb */
+   NULL, /* lv_adjust_loop_header_phi*/
+   NULL, /* extract_cond_bb_edges */
+-  NULL 		/* flush_pending_stmts */
++  NULL, /* flush_pending_stmts */
++  rtl_block_empty_p, /* block_empty_p */
++  rtl_split_block_before_cond_jump, /* split_block_before_cond_jump */
+ };
+ 
+ /* Implementation of CFG manipulation for cfg layout RTL, where
+@@ -3162,6 +3289,8 @@ struct cfg_hooks cfg_layout_rtl_cfg_hook
+   rtl_lv_add_condition_to_bb, /* lv_add_condition_to_bb */
+   NULL, /* lv_adjust_loop_header_phi*/
+   rtl_extract_cond_bb_edges, /* extract_cond_bb_edges */
+-  NULL 		/* flush_pending_stmts */  
++  NULL, /* flush_pending_stmts */  
++  rtl_block_empty_p, /* block_empty_p */
++  rtl_split_block_before_cond_jump, /* split_block_before_cond_jump */
+ };
+ 
+Index: print-rtl.c
+===================================================================
+RCS file: /cvs/gcc/gcc/gcc/print-rtl.c,v
+retrieving revision 1.125
+diff -u -p -r1.125 print-rtl.c
+--- print-rtl.c	16 Aug 2005 00:13:21 -0000	1.125
++++ print-rtl.c	29 Sep 2005 22:15:54 -0000
+@@ -774,16 +774,34 @@ print_rtl (FILE *outf, rtx rtx_first)
+ int
+ print_rtl_single (FILE *outf, rtx x)
+ {
++  return print_rtl_single_with_indent (outf, x, 0);
++}
++
++/* Like print_rtx, except specify a file.  */
++/* Return nonzero if we actually printed anything.  */
++
++int
++print_rtl_single_with_indent (FILE *outf, rtx x, int ind)
++{
++  int old_indent = indent;
++  char *s_indent = (char *) alloca ((size_t) ind + 1);
++  memset ((void *) s_indent, ' ', (size_t) ind);
++  s_indent[ind] = '\0';
++
++  indent = ind;
+   outfile = outf;
+   sawclose = 0;
+   if (! flag_dump_unnumbered
+       || !NOTE_P (x) || NOTE_LINE_NUMBER (x) < 0)
+     {
++      fputs (s_indent, outfile);
+       fputs (print_rtx_head, outfile);
+       print_rtx (x);
+       putc ('\n', outf);
++      indent = old_indent;
+       return 1;
+     }
++  indent = old_indent;
+   return 0;
+ }
+ 
+Index: regions.c
+===================================================================
+RCS file: regions.c
+diff -N regions.c
+--- /dev/null	1 Jan 1970 00:00:00 -0000
++++ regions.c	29 Sep 2005 22:15:55 -0000
+@@ -0,0 +1,3651 @@
++/* Structural analysis of the control flow graph.
++   Copyright (C) 2005, 2012 Free Software Foundation, Inc.
++   Contributed by Kenneth Zadeck <zadeck@naturalbridge.com>
++
++This file is part of GCC.
++
++GCC is free software; you can redistribute it and/or modify it under
++the terms of the GNU General Public License as published by the Free
++Software Foundation; either version 2, or (at your option) any later
++version.
++
++GCC is distributed in the hope that it will be useful, but WITHOUT ANY
++WARRANTY; without even the implied warranty of MERCHANTABILITY or
++FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++for more details.
++
++You should have received a copy of the GNU General Public License
++along with GCC; see the file COPYING.  If not, write to the Free
++Software Foundation, 59 Temple Place - Suite 330, Boston, MA
++02111-1307, USA.  */
++
++#include "config.h"
++#include "system.h"
++#include "coretypes.h"
++#include "tm.h"
++#include "rtl.h"
++#include "tm_p.h"
++#include "insn-config.h"
++#include "recog.h"
++#include "function.h"
++#include "regs.h"
++#include "alloc-pool.h"
++#include "hard-reg-set.h"
++#include "bitmap.h"
++#include "basic-block.h"
++#include "output.h"
++#include "tree.h"
++#include "langhooks.h"
++#include "ggc.h"
++
++static bitmap_obstack transient_region_obstack;
++static bitmap_obstack persistent_region_obstack;
++static void minimize_improper_regions (basic_block);
++static basic_block new_improper_region (basic_block);
++static struct bb_temp * create_info (basic_block);
++static void analyze_loops (void);
++static void build_recursive_info (basic_block);
++static void analyze_structures (basic_block, int);
++static void dump_case_list (basic_block *, int, int, const char*);
++static void dump_recursive (basic_block, int);
++static void print_region_bb (FILE*, basic_block, const char*);
++static bool get_real_entry_blocks_1 (bitmap, bitmap, basic_block, bitmap, bitmap);
++static bool get_real_exit_blocks_1 (bitmap, bitmap, basic_block, bitmap, bitmap);
++
++
++/* This array serves two purposes, it first holds all of the original
++   basic blocks in postorder. It also holds all of the region nodes
++   that are added at the end.  */
++static basic_block *nodes_in_postord;
++static unsigned int nodes_in_postord_size;
++
++static int region_stats[(int)SWITCH_REGION+1];
++
++/*
++This module builds a structure graph on top of the control flow
++graph. Various types of single entry structured region types are
++identified and "reduced" to single nodes.  (The exception to this are
++multiple entry loops for which a special entry nodes are created to
++funnel all of the entries thru.)  The region nodes are special basic
++blocks that do not contain any instructions but do contain information
++the encapsulates the region.
++
++This module has been implemented so that it can be run at either the
++tree level or the rtl level.  In both cases it assumes that the
++control flow graph has been built and is in good working order.
++
++A call to create_regions() will analyze the cfg and construct the
++region tree.  The root of that tree can be accessed by ROOT_BLOCK_PTR
++or (ROOT_BLOCK_PTR_FOR_FUNCTION(FN)).
++
++When the region tree is not needed anymore, a call delete_regions()
++will clean up everything.
++
++There are several design choices that have been made in order to make
++this analysis work within the limitations of the gcc data structures.
++Even though region nodes are basic blocks, they are not linked into
++the standard list of basic blocks for the function.  This has been
++done to minimize the amount of code that must be changed.  A great
++deal of the compiler would not know how to handle the region nodes.
++
++Likewise, the original set of preds and succs are not touched.  There
++are special region_preds and region_succs that are used here.
++
++The iteration thru the control tree is best done recursively, start at
++the root region node which is stored in the ROOT_BLOCK_PTR and iterate
++with FOR_EACH_BB_IN_REGION, recurse for every node that is not a
++SINGLE_NODE_REGION.
++
++For many of the region types, there are fields in the region node that
++allow the region to be processed in a structured manner.  This is
++subject to change in is expected to be enhanced as uses develop.
++
++Two way conditional are generally matched to the basic_blocks at the
++tree level and only sometimes matched at the rtl level.  This is
++because EDGE_TRUE_VALUE and EDGE_FALSE_VALUE are only occasionally set
++at the rtl level.  Any one who thinks they can do better is welcome to
++try.  Likewise, there is no matching between the label and the arms of
++a case statement.  These are problems that should be addressed.
++
++The definition of a case statement is rather liberal.  Returns and
++loop exits are allowed as well as drop thru's from one case to the
++next.  There is a lot of complex code to make this work and it should
++not be tampered with by the casual user.
++
++It is also possible that more region types could be added.  These can
++be tricky, but it quite useful to have as much of the control flow
++covered by high level regions as possible.  Anyone who has a region
++that they feel would be useful to add, should contact
++zadeck@naturalbridge.com for help.
++
++Another place where this will be extended is to track changes in the
++cfg.  For a large number of changes this should not be hard, and it
++will be generally more useful than reparsing the graph.  Suggestions
++on a api for this would be appreciated.
++
++The liberal definition of regions has the advantage that a large
++amount of a function can be completely covered by regions.  The
++downside is that many of the regions may not be single entry or single
++exit.  There are two functions, SINGLE_ENTRY_REGION_P and
++SINGLE_EXIT_REGION_P that can be used to determine this.  The sets of
++entry nodes and exit nodes can be found by GET_REAL_ENTRY_REGIONS and
++GET_REAL_EXIT_REGIONS.  For single entry or exit regions these return
++simple answers.  For multiple entry and exit regions, these return a
++set of blocks and a set of bits to say weather to use the end of that
++block or the beginning as the logical boundary of the block.  For many
++algorithms, just doing something for the single entry or exits may be
++good enough.
++
++*/
++
++/*
++This implementation is based loosely on control flow analysis by an
++algorithm by Sharir and Schwartz that appeared in the journal
++"Computer Languages" (1980 vol 5, pgs 141-153).  The handling of
++irreducible regions is based on unpublished (and unpatented)
++techniques developed at HP.  The combined algorithm was then
++generalized by Barry Rosen of IBM, Carol Thompson of HP and Kenneth
++Zadeck of IBM in preparation for a book that was never and will never
++be published.  The comments in this module are taken from the text of
++that chapter and the code was translated from the pseudocode examples
++of that chapter all with permission of the authors.
++*/
++
++/*
++NESTED SINGLE-ENTRY REGIONS
++
++Many transformation techniques assume that the control flow graph CFG
++has been analyzed as a hierarchy of regions.  Each REGION is a
++subgraph with a distinguished node h (sometimes called the HEAD or
++HEADER) such that h is the only node in the subgraph that may have
++inedges from outside.  The REGION_HEAD field is used for this. The
++qualifier "single-entry" is logically redundant but is sometimes added
++for emphasis or to contrast with other possible uses of "Region" as a
++technical term.  For historical reasons, regions are often called
++INTERVALS.  The name INTERVAL ANALYSIS has been applied to several
++distinct ways to define and build hierarchies of regions.
++
++For a given region R, any edge (x,y) with x in R but y not in R is an
++EXIT EDGE.  Any node in R with at least one exit edge among its
++outedges is an EXIT NODE.
++
++A CONTROL TREE is a tree whose nodes are regions.  The root of the
++tree is a huge region consisting of the entire control-flow graph CFG,
++with ENTRY as the header.  The leaves are tiny regions consisting of
++single basic blocks.  At intermediate levels in the tree are regions
++of intermediate size.  These regions are NESTED: for any regions R and
++S in the tree, the following conditions hold:
++
++* If R is a descendant of S in the control tree, then R is a subset of S.
++
++* If R and S are independent in the control tree, then R union S =
++  EMPTYSET.
++
++If CFG has n nodes, then it has a trivial control tree with n+1
++regions.  Several nontrivial kinds of control tree used in compiling
++are explained later in this chapter.  Nontrivial control trees support
++divide-and-conquer strategies in optimization.  When a region R is
++processed, each child region S is treated LIKE a single node, with an
++inedge for each inedge of the header of S and an outedge for each exit
++edge of S.  (The actual complexity of control flow within S is
++temporarily ignored.)  Thus a region with K children in the control
++tree defines a graph with K+1 nodes.  Several kinds of analysis and
++optimization benefit from replacing one large and complex graph CFG by
++a family of smaller and simpler graphs, organized by the control tree.
++Indeed, it is often convenient to think of the control tree as a tree
++of graphs.  Because each of these graphs abstracts away the internal
++complexity of child regions, they are called ABSTRACT graphs here.
++
++The control tree is yet another tree structure, not to be confused
++with the parse tree.  Control-flow analysis is concerned with the
++actual control-flow relations among basic blocks.  For procedures that
++contain RETURN, BREAK, or GOTO statements, these relations differ from
++those suggested by the syntactic nesting of explicit control
++structures like WHILE and IF-THEN in the parse tree.
++
++Loops
++
++A LOOP is a strongly connected (single-entry) region.  Given a control
++tree, a REDUCED LOOP is a loop that appears in the tree and has an
++abstract graph that becomes acyclic when all inedges of the header are
++ignored.  In particular, code that loops over the elements of an array
++of dimension d can be described by a control tree that has d reduced
++loops.
++
++Loops are so important in optimization that some kinds of control tree
++are constructed with very few regions other than loops.  The
++control-flow graph is said to be REDUCIBLE if the abstract graph at
++each node of its control tree is EITHER acyclic OR a reduced loop.
++
++Some optimization techniques presuppose reducibility, so it is
++fortunate that most of the control-flow graphs encountered in practice
++are indeed reducible.  Other techniques are still feasible, but more
++complex, when CFG is irreducible.  If the exceptional abstract graphs
++caused by improper regions are few and small, then the extra work they
++require may be modest.
++
++If CFG is reducible, then the control tree actually built is indeed
++one where each of the abstract graphs is well-behaved (either acyclic
++or a reduced loop).  If CFG is irreducible, then most of the abstract
++graphs are still well-behaved.
++
++Structural analysis builds a more elaborate tree whose regions display
++control structures (like the IF-THEN-ELSE) as well as loops.
++
++Building Control Trees
++
++Various ways to define and build control trees have been proposed.
++This section considers some issues common to the two techniques
++explained in detail in the following two sections.  Both techniques
++assume that basic blocks have been identified, the control-flow graph
++CFG has been built, depth-first search has assigned preorder and
++postorder numbers to the nodes.  In the case of irreducibility, the
++dominator tree, with its associated preorder and postorder numbers,
++must also be built.
++
++Whenever we decide that a node x heads a nontrivial region R, we call
++a routine new_region(x,R,rt,info) that creates a new node u to
++represent R and marks u as representing a region of type rt, where rt
++is one of a fixed set of descriptive strings like "ReducedLoop."
++During the rest of the analysis, x and the other nodes in R are
++invisible, but u is treated like any other node in CFG, with preorder
++numbers, postorder numbers, and to handle irreducibility, dominator
++tree preorder numbers, dominator tree postorder numbers, and immediate
++dominator inherited from x.  The call new_region(x,R,rt,info) also creates
++new inedges for u in CFG (to represent the inedges of x from outside
++R) and new outedges for u in CFG (to represent the exit edges of R).
++
++The graph CFG seen by the analysis is constantly changing, as regions
++are recognized and new nodes are created to encapsulate them.  To
++manage these changes and to manage the dynamic collection of nodes in
++the control-tree, it is helpful to add more attributes to the nodes
++and to consider CFG nodes and control-tree nodes as the same kind of
++object, simply called a NODE hereafter.  When NewRegion creates a new
++node, it initializes the attributes as discussed below.
++
++The set VisibleNodes of currently visible nodes is maintained by
++new_region after being initialized by initialize_from.
++
++The shared variable visible_nodes persists across calls on new_region,
++and initialize_from defined below.
++*/
++
++static bitmap visible_nodes;
++
++/*
++The last call on new_region is the one from ROOT_REGION which is
++called at the end of analysis to put visible_nodes into a single
++region at the root of the control tree.
++
++There are three groups of fields associated with the structural
++analysis:
++
++1) Fields that are associated with every regular block and will
++   remain after the analysis.  These are part of the regular basic
++   block structure.
++
++   * The parent_region field points to a node h != x that corresponds
++     to a region containing x.  When x is created, we set
++     parent_region of x to NULL.  When x joins h->blocks_in_region,
++     we set x->parent_region to h.
++
++   * x->in_region points to a node that corresponds to a region
++     containing $x$.  When x is created, we set in_region of x to
++     NULL.  When x joins h->blocks_in_region, we set x->in_region to
++     h.  Unlike parent_region, x->in_region may later be updated, so
++     as to point to a proper ancestor of h in the control tree and
++     thus a larger region in cfg that contains x.
++
++2) Fields that are associated with the region nodes and will
++   remain after the analysis.  These are allocated into a struct
++   basic_basic_region_def defined in basic_block.h and are assigned to
++   the region_info field of the basic block.  They are only allocated
++   for region nodes.  For regular blocks this field is NULL.
++
++   * The field region_type telling what type of region the block
++     represents.  If the region_info is NULL, the block is assumed to
++     be a SINGLE_NODE_REGION.
++
++3) Fields that are necessary for the analysis of the function but
++   can be discarded after the analysis is complete.  These are defined
++   in the bb_temp structure that is assigned to the basic_block's aux
++   field and then cleaned up at the end of analysis.
++
++   * The bitmap blocks_in_region contains the set of nodes
++     in the regions just below the region represented by the node.
++
++   * The preds and succs of the basic block as a bitmap.
++
++   * The visible_preds of each basic block x holds the set of
++     currently visible predecessors, which is not to be confused with
++     the original set preds if x was originally in CFG.  Similarly,
++     the field visible_succs holds the set of currently visible
++     successors.
++
++   * In order to take irreducibility into account, two additional
++     fields are requirred.  At each basic block x we store a bitmap,
++     improper_nodes, of blocks y that will eventually be included in
++     an improper region headed by x.  Because, in the usual case of a
++     reducible graph, this set remains empty throughout the analysis,
++     this bitmap is not allocated until necessary.
++
++   * At each block x we store a pointer improper_head to a node h that
++     will head an improper region containing x.  When x is created, we
++     set ImproperHead[x] to NULL.  In the usual case of a reducible
++     graph, this field remains NULL throughout the analysis.
++
++*/
++
++struct bb_temp
++{
++  basic_block improper_head;
++  /* IN_REGION is used as a temp structure to find the entries to an
++     improper region.  */
++  basic_block in_region;
++  basic_block same_dominator_as;
++  bool visited;
++  /* Fields used to find the merge point in a case statement.  */
++  int num_path;
++  int num_pred_in_set;
++  int preord;
++  int postord;
++  /* For regular blocks, this is the postorder number, region nodes
++ are just sequentially numbered after the last block.  */
++  unsigned int index;
++  bitmap preds;
++  bitmap succs;
++  bitmap visible_preds;
++  bitmap visible_succs;
++  bitmap improper_nodes;
++  bitmap blocks_in_region;
++};
++
++/* The region nodes get a positive NEXT_BITMAP_INDEX that is kept in
++   the info field.  This is used as an index into bitmaps.  The
++   NEXT_REGION_INDEX is an arbitrary negative number used for
++   identification.  This is stored in the basic_block index field.  It
++   should not be postitive since these nodes are not put in the list
++   and vectors of all blocks.*/
++static unsigned int next_bitmap_index;
++static int next_region_index;
++
++/* Remove y from it's current parent region.  */
++static void 
++remove_from_current_region (basic_block y)
++{
++  struct bb_temp *y_info = (struct bb_temp *)y->aux;
++  basic_block z = y->parent_region;
++  struct bb_temp *z_info = (struct bb_temp *)z->aux;
++  bitmap_clear_bit (z_info->blocks_in_region, y_info->index);
++  y->parent_region = NULL;
++}
++
++/* Build the specialized region basic_block of type RT for a region
++   with the entry block entry block X, containing
++   BLOCKS_IN_REGION.  */
++static basic_block
++new_region (basic_block x,
++	    bitmap blocks_in_region,
++	    enum region_type rt,
++	    region_details_u * region_details)
++{
++  struct bb_temp *x_info = (struct bb_temp *)x->aux;
++  unsigned int x_index = x_info->index;
++  unsigned int y_index, z_index;
++  bitmap_iterator bi, bi2;
++  basic_block u = alloc_block ();
++  unsigned int u_index = next_bitmap_index++;
++  struct bb_temp *u_info = create_info (u);
++  u->parent_region = NULL;
++  u->prev_bb_in_region = NULL;
++  u->next_bb_in_region = NULL;
++  u->next_bb = NULL;
++  u->prev_bb = NULL;
++  u->index = --next_region_index;
++
++  u->region_info = ggc_alloc_cleared (sizeof (struct basic_block_region_def));
++  u->region_info->type = rt;
++  u->region_info->region_head = x;
++  u->region_info->region_details = region_details;
++
++  u_info->in_region = NULL;
++  u_info->preord = x_info->preord;
++  u_info->postord = x_info->postord;
++  u_info->index = u_index;
++
++  region_stats[(int)rt]++;
++
++  gcc_assert(u_index < nodes_in_postord_size);
++  nodes_in_postord[u_index] = u;
++  u_info->blocks_in_region = blocks_in_region;
++  u_info->same_dominator_as = x;
++
++  /* For every node z outside the region that points to the region
++     node...
++
++     For every z in (x.visible_preds intersect ~region) :
++       add z to u.preds
++       remove x from z.visible_succs
++       add u to z.visible_succs.
++  */
++			
++  EXECUTE_IF_SET_IN_BITMAP(x_info->visible_preds, 0, z_index, bi)
++    {
++      if (!bitmap_bit_p (blocks_in_region, z_index))
++	{
++	  basic_block z = nodes_in_postord[z_index];
++	  struct bb_temp *z_info = (struct bb_temp *)z->aux;
++	
++	  bitmap_set_bit (u_info->preds, z_index);
++	  bitmap_clear_bit (z_info->visible_succs, x_index);
++	  bitmap_set_bit (z_info->visible_succs, u_index);
++	}
++    }
++
++  /* For every node z outside the region with a pred that points back
++     into the region...
++
++     For every y in region :
++       for every z in (y.visible_succs intersect ~region) :
++         add z to u.succs
++	 remove y from z.visible_succs
++	 add u to z.visible_succs.
++  */
++  EXECUTE_IF_SET_IN_BITMAP(blocks_in_region, 0, y_index, bi)
++    {
++      basic_block y = nodes_in_postord[y_index];
++      struct bb_temp *y_info = (struct bb_temp *)y->aux;
++
++      if (y->parent_region)
++	remove_from_current_region (y); 
++      y->parent_region = u;
++      y_info->in_region = u;
++
++      EXECUTE_IF_SET_IN_BITMAP(y_info->visible_succs, 0, z_index, bi2)
++	{
++	  if (!bitmap_bit_p (blocks_in_region, z_index))
++	    {
++	      basic_block z = nodes_in_postord[z_index];
++	      struct bb_temp *z_info = (struct bb_temp *)z->aux;
++	
++	      bitmap_set_bit (u_info->succs, z_index);
++	      bitmap_clear_bit (z_info->visible_preds, y_index);
++	      bitmap_set_bit (z_info->visible_preds, u_index);
++	    }
++	}
++    }
++
++  bitmap_copy (u_info->visible_succs, u_info->succs);
++  bitmap_copy (u_info->visible_preds, u_info->preds);
++  bitmap_and_compl_into (visible_nodes, blocks_in_region);
++  bitmap_set_bit (visible_nodes, u_index);
++
++  /* Since irreducibility is rare, delay creating the bitmap for
++     improper_nodes until it is necessary.  */
++  u_info->improper_head = NULL;
++  u_info->improper_nodes = NULL;
++
++  return u;
++}
++
++/* Just your basic depth first search to set the pre and post order
++   numbers and build the array of blocks in postord.  */
++
++static int r_count, s_count, original_node_count;
++
++static void
++dfs_forward (basic_block x)
++{
++  struct bb_temp *x_info = (struct bb_temp *)x->aux;
++  edge_iterator ei;
++  edge e;
++  x_info->preord = r_count++;
++
++  FOR_EACH_EDGE (e, ei, x->succs)
++    {
++      basic_block y = e->dest;
++      struct bb_temp *y_info = (struct bb_temp *)y->aux;
++      if (y_info->preord == -1)
++	dfs_forward(y);
++    }
++  x_info->postord = s_count;
++  x_info->index = s_count;
++  nodes_in_postord[s_count] = x;
++  s_count++;
++}
++
++/* Create and attach the info structure to the aux field of U. */
++static struct bb_temp *
++create_info (basic_block u)
++{
++  struct bb_temp *u_info = (struct bb_temp *)xmalloc (sizeof(struct bb_temp));
++
++  u->aux = u_info;
++  u->parent_region = NULL;
++
++  u_info->in_region = NULL;
++  u_info->preds = BITMAP_ALLOC (&transient_region_obstack);
++  u_info->succs = BITMAP_ALLOC (&transient_region_obstack);
++  u_info->visible_preds = BITMAP_ALLOC (&transient_region_obstack);
++  u_info->visible_succs = BITMAP_ALLOC (&transient_region_obstack);
++  u_info->improper_nodes = NULL;
++  u_info->improper_head = NULL;
++  u_info->blocks_in_region = NULL;
++  u_info->same_dominator_as = NULL;
++  u_info->num_path = 0;
++  u_info->num_pred_in_set = 0;
++
++  return u_info;
++}
++
++int
++split_blocks_for_regions (void)
++{
++  basic_block bb;
++  edge e;
++  edge_iterator ei;
++  int old_max = n_basic_blocks;
++
++  /* Split all of the critical edges and split basic blocks that have
++     interesting code before a conditional branch.  The latter is
++     necessary because the condition part of the block will need to be
++     reduced into the diamond, or looping region and the other part is
++     part of the set up.  This makes a big difference to code
++     placement algorithms that want to drop code before a diamond.  */
++
++  FOR_ALL_BB (bb)
++    {
++      FOR_EACH_EDGE (e, ei, bb->succs)
++	if (EDGE_CRITICAL_P (e))
++	  {
++	    if (e->flags & EDGE_ABNORMAL)
++	      {
++		if (dump_file)
++		  fprintf (dump_file, "not splitting abnormal edge %d->%d\n",
++			   e->src->index, e->dest->index);
++	      }
++	    else
++	      split_edge (e);
++	  }
++
++      if (!single_succ_p (bb))
++	split_block_before_cond_jump (bb);
++    }
++  FOR_EACH_EDGE (e, ei, ENTRY_BLOCK_PTR->succs)
++    {
++      if (e->flags & EDGE_ABNORMAL)
++	{
++	  if (dump_file)
++	    fprintf (dump_file, "not splitting abnormal edge %d->%d\n",
++		     e->src->index, e->dest->index);
++	}
++      else
++	split_edge (e);
++    }
++
++  FOR_EACH_EDGE (e, ei, EXIT_BLOCK_PTR->preds)
++    {
++      if (e->flags & EDGE_ABNORMAL)
++	{
++	  if (dump_file)
++	    fprintf (dump_file, "not splitting abnormal edge %d->%d\n",
++		     e->src->index, e->dest->index);
++	}
++      else
++	split_edge (e);
++    }
++
++  add_noreturn_fake_exit_edges ();
++  connect_infinite_loops_to_exit ();
++
++  return n_basic_blocks - old_max;
++}
++
++static void
++initialize (bool split_blocks)
++{
++  basic_block bb;
++  int i;
++
++/*   fprintf(stderr, "*****structure tree for %s\n", */
++/* 	  lang_hooks.decl_printable_name (current_function_decl, 2)); */
++
++  /* Get rid of any previous analysis.  */
++  delete_regions ();
++
++  for (i=0; i<((int)SWITCH_REGION)+1; i++)
++    region_stats[i] = 0;
++
++  if (split_blocks)
++    split_blocks_for_regions ();
++
++  /* Now that the edges have been split, recreate the dominator
++     information.  */
++  calculate_dominance_info (CDI_DOMINATORS);
++  bitmap_obstack_initialize (&transient_region_obstack);
++  bitmap_obstack_initialize (&persistent_region_obstack);
++
++  visible_nodes = BITMAP_ALLOC (&transient_region_obstack);
++
++  /* Initialized the pass specific basic block information.  */
++  FOR_ALL_BB (bb)
++    {
++      struct bb_temp *bb_info = create_info (bb);
++      bb->parent_region = NULL;
++      bb->prev_bb_in_region = NULL;
++      bb->next_bb_in_region = NULL;
++      bb->region_info = NULL;
++      bb_info->preord = -1;
++      bb_info->postord = -1;
++    }
++
++  /* We need enough spots to hold all of the original basic blocks +
++     the region nodes added.  */
++  nodes_in_postord_size = ((n_basic_blocks) * 3) + 1;
++  nodes_in_postord = xcalloc (nodes_in_postord_size, sizeof (basic_block));
++
++  r_count = 0;
++  s_count = 0;
++  dfs_forward (ENTRY_BLOCK_PTR);
++  next_bitmap_index = s_count;
++  original_node_count = s_count;
++  next_region_index = 0;
++
++  /* This may not touch all of the blocks in the region.  It will miss
++     those that are not reachable from the ENTEY_BLOCK_PTR.  This is
++     deliberate, this is the set of blocks we are interested in.  */
++  for (i=0; i<s_count; i++)
++    {
++      edge_iterator ei;
++      edge e;
++      struct bb_temp *bb_info;
++      bb = nodes_in_postord[i];
++      bb_info = (struct bb_temp *)bb->aux;
++
++      /* Build a bit vector representation of the preds and succs.  */
++      FOR_EACH_EDGE (e, ei, bb->succs)
++	{
++	  struct bb_temp *d_info = (struct bb_temp *)e->dest->aux;
++	  bitmap_set_bit (bb_info->succs, d_info->index);
++	}
++      FOR_EACH_EDGE (e, ei, bb->preds)
++	{
++	  struct bb_temp *s_info = (struct bb_temp *)e->src->aux;
++	  bitmap_set_bit (bb_info->preds, s_info->index);
++	}
++      bitmap_copy (bb_info->visible_succs, bb_info->succs);
++      bitmap_copy (bb_info->visible_preds, bb_info->preds);
++
++      bitmap_set_bit (visible_nodes, bb_info->index);
++    }
++}
++
++/* Cleanup all of the transient data structures.  */
++static void
++cleanup (void)
++{
++  basic_block * a_map =
++    (basic_block*)alloca ((size_t)(original_node_count *sizeof (basic_block)));
++  unsigned int i, j;
++  bitmap b_map = BITMAP_ALLOC (&transient_region_obstack);
++  basic_block bb;
++
++  for (i=0; i < next_bitmap_index; i++)
++    {
++      basic_block bb = nodes_in_postord[i];
++      struct bb_temp *bb_info = (struct bb_temp *)bb->aux;
++      unsigned int x_index;
++      bitmap_iterator bi;
++
++      if (get_region_type (bb) != ROOT_REGION)
++	{
++	  basic_block p = bb->parent_region;
++	  struct bb_temp *p_info;
++	  gcc_assert (p);
++	  p_info = (struct bb_temp *)p->aux;
++	  gcc_assert (bitmap_bit_p (p_info->blocks_in_region, bb_info->index));
++	}
++
++      if (!single_block_region_p (bb))
++	{
++	  /* The nodes in the bitmap are stored in an odd order
++	     (mostly postord with the region nodes at the end).
++	     However, we want to link them in preorder. The trick is
++	     to radix sort the basic blocks.  Note that there are
++	     several nodes with the same preorder number (since the
++	     entry block of the region shares its preorder number with
++	     the region node), however, the nodes in a particular
++	     region have unique preorder numbers.  */
++
++	  basic_block_region bb_region = bb->region_info;
++	  bitmap_clear (b_map);
++	  EXECUTE_IF_SET_IN_BITMAP(bb_info->blocks_in_region, 0, x_index, bi)
++	    {
++	      basic_block x = nodes_in_postord[x_index];
++	      struct bb_temp *x_info = (struct bb_temp *)x->aux;
++	      a_map [x_info->preord] = x;
++	      bitmap_set_bit (b_map, x_info->preord);
++	    }
++
++	  EXECUTE_IF_SET_IN_BITMAP(b_map, 0, x_index, bi)
++	    {
++	      basic_block x = a_map[x_index];
++	      gcc_assert (x->parent_region == bb);
++
++	      if (bb_region->first_bb_in_region)
++		{
++		  /* Add node at end. */
++		  basic_block old_last_node = bb_region->last_bb_in_region;
++		  old_last_node->next_bb_in_region = x;
++		  bb_region->last_bb_in_region = x;
++		  x->prev_bb_in_region = old_last_node;
++		  x->next_bb_in_region = NULL;
++		}
++	      else
++		{
++		  /* First node in.  */
++		  bb_region->first_bb_in_region = x;
++		  bb_region->last_bb_in_region = x;
++		  x->prev_bb_in_region = NULL;
++		  x->next_bb_in_region = NULL;
++		}
++	    }
++	}
++
++      /* Move the edges to persistent storage.  */
++      bb->num_region_preds = bitmap_count_bits (bb_info->visible_preds);
++      bb->region_preds = xcalloc (bb->num_region_preds, sizeof (basic_block));
++      j = 0;
++      EXECUTE_IF_SET_IN_BITMAP(bb_info->visible_preds, 0, x_index, bi)
++	{
++	  bb->region_preds[j++] = nodes_in_postord[x_index];
++	}
++      bb->num_region_succs = bitmap_count_bits (bb_info->visible_succs);
++      bb->region_succs = xcalloc (bb->num_region_succs, sizeof (basic_block));
++      j = 0;
++      EXECUTE_IF_SET_IN_BITMAP(bb_info->visible_succs, 0, x_index, bi)
++	{
++	  bb->region_succs[j++] = nodes_in_postord[x_index];
++	}
++    }
++
++  if (dump_file)
++    {
++      dump_structure_graph ();
++      for (i=0; i<=(int)SWITCH_REGION; i++)
++	fprintf (dump_file, "%s = %d\n",
++		 get_region_type_name ((enum region_type)i),
++		 region_stats[i]);
++    }
++  
++  for (i=0; i < next_bitmap_index; i++)
++    {
++      basic_block bb = nodes_in_postord[i];
++      free(bb->aux);
++      bb->aux = NULL;
++    }
++  
++  /* FIXME: It is silly to have to do this, but there are nodes that
++     are not reachable and they also need their aux field cleared.  If
++     there were an easy way to get rid of these, any block with an aux
++     field at this point is unnecessary.  */
++  FOR_ALL_BB (bb)
++    {
++      if (bb->aux)
++	{
++	  gcc_assert (!bb->parent_region);
++	  free(bb->aux);
++	  bb->aux = NULL;
++	}
++    }
++  
++  /* All region blocks are number with negative numbers.  */
++  n_region_blocks = -(next_region_index - 1);
++  
++  free_dominance_info (CDI_DOMINATORS);
++  free (nodes_in_postord);
++  visible_nodes = NULL;
++  bitmap_obstack_release (&transient_region_obstack);
++}
++
++static bool
++is_ancestor (basic_block x, basic_block y)
++{
++  struct bb_temp *x_info = (struct bb_temp *)x->aux;
++  struct bb_temp *y_info = (struct bb_temp *)y->aux;
++
++  return (x_info->preord <= y_info->preord)
++    && (x_info->postord >= y_info->postord);
++}
++
++/* Recurse down the set of region nodes to find an orignal basic block
++   that has the same dominance information as X. */
++
++static basic_block
++get_same_dominator_as (basic_block x)
++{
++  struct bb_temp *x_info = (struct bb_temp *)x->aux;
++  if (x_info->same_dominator_as)
++    return get_same_dominator_as (x_info->same_dominator_as);
++  else return x;
++}
++
++/*
++   CREATE_REGIONS is the main entry point for creating the structure graph.
++
++   Unlike the original algorithm, create_regions has 5 phases:
++   initialize, analyze_loops, analyze_structures,
++   build_recursive_info,and cleanup.
++
++   The analyze_loops, and analyze_structures are done in separate
++   passes so that latter can handle loop_exits as a structure type.
++   This can only be done after the loop is reduced.
++*/
++
++void
++create_regions (bool split_blocks)
++{
++  initialize (split_blocks);
++
++  analyze_loops ();
++
++  analyze_structures (ROOT_BLOCK_PTR, 0);
++
++  build_recursive_info (ROOT_BLOCK_PTR);
++
++  cleanup ();
++}
++
++/* Walk the region graph starting at X to build the
++   basic_blocks_in_region info.  */
++
++static void
++build_recursive_info (basic_block x)
++{
++  struct bb_temp *x_info = (struct bb_temp *)x->aux;
++  bitmap_iterator bi;
++  unsigned int y_index;
++  bitmap basic_blocks_in_region = BITMAP_ALLOC (&persistent_region_obstack);
++  bitmap regions_in_region = BITMAP_ALLOC (&persistent_region_obstack);
++  x->region_info->basic_blocks_in_region = basic_blocks_in_region;
++  x->region_info->regions_in_region = regions_in_region;
++
++  EXECUTE_IF_SET_IN_BITMAP(x_info->blocks_in_region, 0, y_index, bi)
++    {
++      basic_block y = nodes_in_postord [y_index];
++      enum region_type rt = get_region_type (y);
++      
++      if (rt == SINGLE_NODE_REGION)
++	bitmap_set_bit (basic_blocks_in_region, y->index);
++      else 
++	{
++	  build_recursive_info (y);
++	  bitmap_ior_into (basic_blocks_in_region, 
++			   y->region_info->basic_blocks_in_region);
++
++	  bitmap_set_bit (regions_in_region, -(y->index));
++	  bitmap_ior_into (regions_in_region, 
++			   y->region_info->regions_in_region);
++	}
++    }
++}
++
++
++/* Helper function to new_improper_region.  */
++
++static basic_block
++largest_region (basic_block x)
++{
++  struct bb_temp *x_info = (struct bb_temp *)x->aux;
++  if (x_info->in_region == NULL)
++    return x;
++  else
++    {
++      x_info->in_region = largest_region (x_info->in_region);
++      return x_info->in_region;
++    }
++}
++
++/*
++   If x->improper_nodes is nonempty at the top of create_regions, then
++   we must hide it in an improper region before continuing.  Nodes
++   that were visible at the time they joined x->improper_nodes may
++   subsequently have been hidden in smaller improper regions, so
++   new__mproper_region applies the largest_region function to
++   construct the argument it passes to new_region.
++*/
++
++static basic_block
++new_improper_region (basic_block x)
++{
++  struct bb_temp *x_info = (struct bb_temp *)x->aux;
++  unsigned int x_index = x_info->index;
++
++  unsigned int y_index;
++  bitmap_iterator bi;
++  unsigned int entry_node_count = 0;
++
++  bitmap region = BITMAP_ALLOC (&transient_region_obstack);
++  basic_block * a_map =
++    (basic_block*)alloca ((size_t)(next_bitmap_index *sizeof (basic_block)));
++
++  region_details_u * block_info =
++    xmalloc (sizeof (struct improper_region_s));
++
++  bitmap_set_bit (region, x_index);
++
++  /* Build the region set.  */
++  EXECUTE_IF_SET_IN_BITMAP(x_info->improper_nodes, 0, y_index, bi)
++    {
++      basic_block y = largest_region (nodes_in_postord[y_index]);
++      struct bb_temp *y_info = (struct bb_temp *)y->aux;
++      bitmap_set_bit (region, y_info->index);
++    }
++
++  /* Discover the entry nodes to the region.  */
++  EXECUTE_IF_SET_IN_BITMAP(region, 0, y_index, bi)
++    {
++      basic_block y = nodes_in_postord[y_index];
++      struct bb_temp *y_info = (struct bb_temp *)y->aux;
++
++      if (bitmap_intersect_compl_p (y_info->visible_preds, region))
++	a_map[entry_node_count++] = y;
++    }
++
++  block_info->improper_region.entry_count = entry_node_count;
++  block_info->improper_region.entries =
++    xcalloc (entry_node_count, sizeof (basic_block));
++
++  memcpy (block_info->improper_region.entries,
++	  a_map,
++	  entry_node_count * sizeof (basic_block));
++
++  return new_region(x, region, IMPROPER_REGION, block_info);
++}
++
++/* Improper regions may be unavoidable, but we can keep them small by
++   calling minimize_improper_regions(x).  When
++   minimize_improper_regions(x) begins, most of the successors of x
++   are earlier than x in postorder and have already been processed.
++   However, if y is a successor of x that has not already been
++   processed, then (x,y) is a back edge and receives special attention
++   later, when y is processed.
++
++   Several successors y of x may have y->improper_head != NULL.  The
++   smallest postord of y->ImproperHead represents the smallest
++   improper region that must contain x if (x,y) is to be within the
++   region headed by y->improper_head.  Once x has been put into this
++   region, it is automatically in larger regions and so need not be in
++   any other improper_nodes sets.  Each y->improper_head dominates y
++   and is not x, so each y->improper_head dominates x.  The various
++   y->improper_head are thus ancestor-comparable in the dominator
++   tree.  Among such nodes, comparing postorder numbers is enough to
++   compute ancestry.
++*/
++
++static void
++minimize_improper_regions (basic_block x)
++{
++  struct bb_temp *x_info = (struct bb_temp *)x->aux;
++  basic_block h = x_info->improper_head;
++  unsigned int y_index;
++  bitmap_iterator bi;
++  int min_postord_seen;
++
++  if (h == NULL)
++    min_postord_seen = n_basic_blocks + 1;
++  else
++    {
++      struct bb_temp *h_info = (struct bb_temp *)h->aux;
++      min_postord_seen = h_info->postord;
++    }
++
++  EXECUTE_IF_SET_IN_BITMAP(x_info->visible_succs, 0, y_index, bi)
++    {
++      basic_block y = nodes_in_postord[y_index];
++      struct bb_temp *y_info = (struct bb_temp *)y->aux;
++      basic_block z = y_info->improper_head;
++
++      if (z != NULL)
++	{
++	  struct bb_temp *z_info = (struct bb_temp *)z->aux;
++	  if (min_postord_seen > z_info->postord)
++	    {
++	      min_postord_seen = z_info->postord;
++	      h = z;
++	    }
++	}
++    }
++
++  if (min_postord_seen != n_basic_blocks + 1)
++    {
++      struct bb_temp *h_info = (struct bb_temp *)h->aux;
++      x_info->improper_head = h;
++
++      /* Doing this to x after h is determined saves work and removes
++	 a confusing dependence of intermediate results on order of
++	 traversing succ. */
++
++      if (h_info->improper_nodes == NULL)
++	h_info->improper_nodes = BITMAP_ALLOC (&transient_region_obstack);
++      bitmap_set_bit (h_info->improper_nodes, x_info->index);
++    }
++}
++
++/* Find the loop structure of the function.
++   Loop Analysis
++
++   The algorithm is easier to understand if we begin by pretending
++   that CFG is already known to be reducible.
++
++   If only reducible graphs were to be considered, we could decide
++   whether each node x in a postorder traversal of the set NodesInCFG
++   of nodes of CFG is the head of a loop.  If it is, then we call
++   NewRegion for the region type "ReducedLoop" before continuing the
++   traversal.
++
++   If x is indeed the head of a loop, then the (currently visible)
++   predecessors y of x include some descendants of x in the tree built
++   by depth-first search.
++
++   These are put into the initial set loop_body by the while loop
++   marked REDUCIBLE.  The final set loop_body contains these
++   predecessors, any of their predecessors that are also descendants
++   of x, and so on.
++
++   Because irreducible control flow does arise in practice, we must
++   deal with it.  If improper_nodes of x has become nonempty by the
++   time we visit x, then the step below marked IMPROPER resets x to
++   the new node returned by new_improper(x) which is just the result
++   of calling new_region for the set of nodes:
++
++   R = x union largest_region(y) for all y in x->improper_nodes
++
++   where the call largest_region(y) returns the node corresponding to
++   the largest region (among those found so far) that contains y.
++*/
++
++static void
++analyze_loops (void)
++{
++  int i;
++  int num_blocks = next_bitmap_index;
++  bitmap loop_body = BITMAP_ALLOC (&transient_region_obstack);
++  bitmap new_in_loop_body;
++  basic_block last_x = NULL;
++  unsigned int yy;
++  bitmap_iterator bi;
++
++  new_in_loop_body = BITMAP_ALLOC (&transient_region_obstack);
++
++  for (i=0; i<num_blocks; i++)
++    {
++      basic_block x = nodes_in_postord[i];
++      bool reduce = true;
++      unsigned int x_index, y_index, z_index;
++
++      struct bb_temp *x_info = (struct bb_temp *)x->aux;
++
++      /* IMPROPER Since improper regions are rare, this is null until
++	 one is found.  */
++      if (x_info->improper_nodes)
++	if (!bitmap_empty_p (x_info->improper_nodes))
++	  x = new_improper_region (x);
++
++      x_info = (struct bb_temp *)x->aux;
++      x_index = x_info->index;
++
++      /* See if we can find a loop with header at x.  */
++      bitmap_clear (loop_body);
++
++      EXECUTE_IF_SET_IN_BITMAP(x_info->visible_preds, 0, y_index, bi)
++	{
++	  basic_block y = nodes_in_postord[y_index];
++	  struct bb_temp *y_info = (struct bb_temp *)y->aux;
++	
++	  if (is_ancestor (x, y))
++	    bitmap_set_bit (loop_body, y_info->index);
++	}
++
++      bitmap_copy (new_in_loop_body, loop_body);
++
++      /* At this point we have a loop but we have not follow all the
++	 preds backwards to find all of the nodes in the loop.  */
++      while (!bitmap_empty_p (new_in_loop_body))
++	{
++	  y_index = bitmap_first_set_bit (new_in_loop_body);
++	  bitmap_clear_bit (new_in_loop_body, y_index);
++	
++	  if (y_index != x_index)
++	
++	    /* In the usual case of a reducible graph, every node z
++	       visited in the loop over the bitmap below is a
++	       descendant of x and is added to LoopBody.  If z != x,
++	       then the predecessors of z are visited when a later
++	       iteration of the outer loop sets y to z.
++	    */
++	    {
++	      basic_block y = nodes_in_postord[y_index];
++	      struct bb_temp *y_info = (struct bb_temp *)y->aux;
++	      EXECUTE_IF_SET_IN_BITMAP(y_info->visible_preds, 0, z_index, bi)
++		{
++		  if (!bitmap_bit_p (loop_body, z_index))
++		    {
++		      if (is_ancestor (x, nodes_in_postord[z_index]))
++			{
++			  bitmap_set_bit(loop_body, z_index);
++			  bitmap_set_bit(new_in_loop_body, z_index);
++			}
++		      else
++			/* We still have a loop but it is an
++			   irreducable loop.  */
++			reduce = false;
++		    }
++		}
++	    }
++	}
++
++      if (!bitmap_empty_p (loop_body))
++	{
++	  /* Suppose the loop_body computation visits a node z in
++	     visible_preds[y] that is NOT a descendant of x.  Because
++	     y in loop_body with y != x, there is a cycle x --> y -->
++	     x in CFG.  The edge (z,y) enters this cycle at y rather
++	     than at x, so we clear the flag reduce in this situation.
++	     The combination of loop_body != EMPTYSET and reduce ==
++	     true, on the other hand, tells us that a reduced loop has
++	     been found.
++	  */
++	  if (reduce)
++	    {
++	      bitmap_set_bit (loop_body, x_info->index);
++	      x = new_region(x, loop_body, REDUCED_LOOP_REGION, NULL);
++
++	      /* The region node gets the bitmap.  */
++	      loop_body = BITMAP_ALLOC (&transient_region_obstack);
++	    }
++	  else
++	    {
++	      unsigned int h_index;
++	      basic_block h = NULL;
++	      struct bb_temp *h_info;
++	
++	      /* Nearest common ancestor in dominator tree.  */
++	      EXECUTE_IF_SET_IN_BITMAP(loop_body, 0, y_index, bi)
++		{
++		  if (h == NULL)
++		    {
++		      h_index = bitmap_first_set_bit (loop_body);
++		      h = nodes_in_postord[h_index];
++		    }
++		  else
++		    /* The region nodes are not in the dominator
++		       tree.  However, each region node has the same
++		       dominator information as the entry node of
++		       it's region. We can find that node by looking
++		       in the same_dominator_as field of the node.
++		       However, if the nearest_common_ancestor comes
++		       back with the other node, we want to go back
++		       the other way.  */
++		    {
++		      basic_block h_base = get_same_dominator_as (h);
++		      basic_block y = nodes_in_postord[y_index];
++		      basic_block y_base = get_same_dominator_as (y);
++		      basic_block new_h
++			= nearest_common_dominator (CDI_DOMINATORS,
++						    h_base, y_base);
++		      if (new_h == h_base)
++			new_h = h;
++		      else if (new_h == y_base)
++			new_h = y;
++		      h = new_h;
++		    }
++		}
++	
++	      h_info = (struct bb_temp *)h->aux;
++	      if (h_info->improper_nodes == NULL)
++		h_info->improper_nodes = BITMAP_ALLOC (&transient_region_obstack);
++	      bitmap_ior_into (h_info->improper_nodes, loop_body);
++	
++	      EXECUTE_IF_SET_IN_BITMAP(loop_body, 0, y_index, bi)
++		{
++		  basic_block y = nodes_in_postord[y_index];
++		  struct bb_temp *y_info = (struct bb_temp *)y->aux;
++		  y_info->improper_head = h;
++		}
++	    }
++	}
++
++      minimize_improper_regions (x);
++      last_x = x;
++    }
++
++  /* Make a copy of visible nodes because this will be associated with
++     the root node.  */
++  bitmap_copy (loop_body, visible_nodes);
++
++  /* Find the node with the smallest preord number.  This will be the
++     entry node for the region.  */
++  i = next_bitmap_index;
++  EXECUTE_IF_SET_IN_BITMAP(loop_body, 0, yy, bi)
++    {
++      basic_block y = nodes_in_postord[yy];
++      struct bb_temp *y_info = (struct bb_temp *)y->aux;
++      if (y_info->preord < i)
++	{
++	  i = y_info->preord;
++	  last_x = y;
++	}
++    }
++
++  ROOT_BLOCK_PTR = new_region (last_x, loop_body, ROOT_REGION, NULL);
++
++  BITMAP_FREE (new_in_loop_body);
++}
++
++/* Structural Analysis
++
++   Structural analysis builds a control tree that recognizes common
++   structures like IF--THEN as well as loops.  Compared with the tree
++   built by loop analysis, the structural control tree has more nodes,
++   but the nodes have simpler abstract graphs that tend to resemble
++   each other.  For example, every recognized IF-THEN structure in
++   every program looks like every other IF-THEN structure.  Many of
++   the abstract graphs are so very simple that much of the work of
++   analysis can be done in advance, when the compiler is written
++   rather than when the compiler is running.
++*/
++
++/* Blocks are strings of single-entry single-exit regions.  New_block
++   may add x to an existing BLOCK region rather than start a new one.
++   We want to describe a block of four nodes as a plain sequence [x_0,
++   x_1, x_2, x_3], not as a right-branching binary tree [ x_0, [ x_1,
++   [ x_2, x_3 ] ] ].  If y already heads a BLOCK region R, then we add
++   x to R and return y rather than a new node.
++*/
++
++static basic_block
++new_block (basic_block x)
++{
++  struct bb_temp *x_info = (struct bb_temp *)x->aux;
++  unsigned int x_index = x_info->index;
++  unsigned int y_index = bitmap_first_set_bit (x_info->visible_succs);
++  basic_block y = nodes_in_postord[y_index];
++  struct bb_temp *y_info = (struct bb_temp *)y->aux;
++  unsigned int z_index;
++  bitmap_iterator bi;
++
++  /* Do not collapse the loop header, this was done in the loop
++     pass.  */
++  if (bitmap_bit_p (y_info->visible_succs, x_index))
++    return NULL;
++  else return NULL;
++
++  /* Only branches into blocks are thru x.  */
++  if (bitmap_count_bits (y_info->visible_preds) != 1)
++    return NULL;
++
++  if (get_region_type(y) == BLOCK_REGION)
++    {
++      /* If y is already a block region, incorporate x as the new
++	 first node in region y rather than allocating a new
++	 region.  */
++      basic_block h = y->region_info->region_head;
++      struct bb_temp *h_info = (struct bb_temp *)h->aux;
++      unsigned int h_index = h_info->index;
++
++      if (x->parent_region)
++	remove_from_current_region (x);
++      x->parent_region = y;
++      bitmap_clear_bit (y_info->visible_preds, x_index);
++      bitmap_clear_bit (visible_nodes, x_index);
++
++      EXECUTE_IF_SET_IN_BITMAP(x_info->visible_preds, 0, z_index, bi)
++	{
++	  basic_block z = nodes_in_postord[z_index];
++	  struct bb_temp *z_info = (struct bb_temp *)z->aux;
++
++	  bitmap_set_bit (y_info->visible_preds, z_index);
++	  bitmap_clear_bit (z_info->visible_succs, x_index);
++	  bitmap_set_bit (z_info->visible_succs, y_index);
++	}
++
++      bitmap_clear (x_info->visible_succs);
++      bitmap_set_bit (x_info->visible_succs, h_index);
++
++      bitmap_clear (h_info->visible_preds);
++      bitmap_set_bit (x_info->visible_preds, x_index);
++
++      bitmap_set_bit (y_info->blocks_in_region, x_index);
++      y->region_info->region_head = x;
++      return y;
++    }
++  else
++    {
++      bitmap region = BITMAP_ALLOC (&transient_region_obstack);
++      /* Build a new region that is the concatination of the two
++	 blocks.  */
++      bitmap_set_bit (region, x_index);
++      bitmap_set_bit (region, y_index);
++
++      return new_region (x, region, BLOCK_REGION, NULL);
++    }
++}
++
++/* Determine if the branch to T is marked as the TRUE edge.  T should
++   only have one pred.  */
++static bool
++true_branch_p (basic_block t)
++{
++  struct bb_temp *t_info = (struct bb_temp *)t->aux;
++  basic_block orig_t = nodes_in_postord[t_info->postord];
++  edge_iterator ei;
++  edge e;
++  FOR_EACH_EDGE (e, ei, orig_t->preds)
++    if (e->flags & EDGE_TRUE_VALUE)
++      return true;
++  return false;
++}
++
++/* Determine if the branch to T is marked as the FALSE edge.  T should
++   only have one pred.  */
++static bool
++false_branch_p (basic_block t)
++{
++  struct bb_temp *t_info = (struct bb_temp *)t->aux;
++  basic_block orig_t = nodes_in_postord[t_info->postord];
++  edge_iterator ei;
++  edge e;
++  FOR_EACH_EDGE (e, ei, orig_t->preds)
++    if (e->flags & EDGE_FALSE_VALUE)
++      return true;
++  return false;
++}
++
++/* At the top level there are two types of branches that are
++   considered here:
++
++   1) branches where one edge exits the enclosing region. There are
++   three cases: branch2-exit, if-then-exit, and if-exit-else.
++
++   2) branches where both edges stay in the region. There are two
++   cases: diamond if-then-else
++*/
++
++static basic_block
++new_branch (basic_block x, bitmap blocks_in_parent)
++{
++  struct bb_temp *x_info = (struct bb_temp *)x->aux;
++  bitmap_iterator bi;
++  unsigned int i = 0;
++
++  basic_block * targets = alloca (2 * sizeof (basic_block));
++  int exit_edge = -1;
++  unsigned int y_index;
++  unsigned int returns_found = 0;
++
++  /* Either 0 or 1 of the succs will be in the parent region.  If it
++     is 1, this is a loop exit. The case where both edges exit cannot
++     occur or else the conditional itself would be outside the
++     loop.  */
++
++  EXECUTE_IF_SET_IN_BITMAP(x_info->visible_succs, 0, y_index, bi)
++    {
++      basic_block y = nodes_in_postord[y_index];
++      struct bb_temp *y_info = (struct bb_temp *)y->aux;
++      targets[i] = y;
++      if (!bitmap_bit_p (blocks_in_parent, y_index))
++	exit_edge = i;
++
++      /* While critical edges have been split in the cfg, we could
++	 still have this be true.  This could happen if x has already
++	 been reduced to an IF_THEN_EXIT or an IF-EXIT_ELSE
++	 region.  */
++      if (bitmap_count_bits (y_info->visible_preds) != 1)
++	return NULL;
++
++      /* Count a conditional return as an IF_EXIT like region.  */
++      if (bitmap_count_bits (y_info->visible_succs))
++	{
++	  unsigned int z_index =
++	    bitmap_first_set_bit (y_info->visible_succs);
++	  if (nodes_in_postord[z_index] == EXIT_BLOCK_PTR)
++	    {
++	      exit_edge = i;
++	      returns_found++;
++	    }
++	}
++      if (y == EXIT_BLOCK_PTR)
++	{
++	  exit_edge = i;
++	  returns_found++;
++	}
++      i++;
++    }
++
++  /* If both branches go to the exit_node, then this really is a
++     diamond with the exit_node as the join point.  */
++  if (returns_found == 2)
++    exit_edge = -1;
++
++  if (exit_edge != -1)
++    {
++      int local_edge = 1 - exit_edge;
++      struct bb_temp *l_info = (struct bb_temp *)(targets[local_edge])->aux;
++      bitmap region = BITMAP_ALLOC (&transient_region_obstack);
++
++      /* The exit block is not in the loop.  */
++      bitmap_set_bit (region, x_info->index);
++      bitmap_set_bit (region, l_info->index);
++      if (true_branch_p (targets[exit_edge]))
++	{
++	  region_details_u * branch_info =
++	    xmalloc (sizeof (struct if_exit_else_region_s));
++	  branch_info->if_exit_else_region.exit_region =
++	    targets[exit_edge];
++	  branch_info->if_exit_else_region.else_region =
++	    targets[local_edge];
++	  return new_region (x, region, IF_EXIT_ELSE_REGION, branch_info);
++	}
++      else if (false_branch_p (targets[exit_edge]))
++	{
++	  region_details_u * branch_info =
++	    xmalloc (sizeof (struct if_then_exit_region_s));
++	  branch_info->if_then_exit_region.then_region =
++	    targets[local_edge];
++	  branch_info->if_then_exit_region.exit_region =
++	    targets[exit_edge];
++	  return new_region (x, region, IF_THEN_EXIT_REGION, branch_info);
++	}
++      else
++	{
++	  region_details_u * branch_info =
++	    xmalloc (sizeof (struct branch2_exit_region_s));
++	  branch_info->branch2_exit_region.local_region =
++	    targets[local_edge];
++	  branch_info->branch2_exit_region.exit_region =
++	    targets[exit_edge];
++	  return new_region (x, region, BRANCH2_EXIT_REGION, branch_info);
++	}
++    }
++  else
++    /* Conditional where both nodes stay in loop.  */
++    {
++      /* First check to see if the graph has the correct shape.  */
++      basic_block y = targets[0];
++      struct bb_temp *y_info = (struct bb_temp *)y->aux;
++      basic_block z = targets[1];
++      struct bb_temp *z_info = (struct bb_temp *)z->aux;
++      bitmap region;
++
++      if (!bitmap_equal_p (y_info->visible_succs, z_info->visible_succs)
++	  || (bitmap_count_bits(z_info->visible_preds) != 1))
++	return NULL;
++
++      region = BITMAP_ALLOC (&transient_region_obstack);
++      bitmap_set_bit (region, x_info->index);
++      bitmap_set_bit (region, y_info->index);
++      bitmap_set_bit (region, z_info->index);
++
++      if (true_branch_p (y))
++	{
++	  region_details_u * branch_info =
++	    xmalloc (sizeof (struct if_then_else_region_s));
++	  branch_info->if_then_else_region.then_region = y;
++	  branch_info->if_then_else_region.else_region = z;
++	  return new_region (x, region, IF_THEN_ELSE_REGION, branch_info);
++	}
++      else if (false_branch_p (y))
++	{
++	  region_details_u * branch_info =
++	    xmalloc (sizeof (struct if_then_exit_region_s));
++	  branch_info->if_then_exit_region.then_region = z;
++	  branch_info->if_then_exit_region.exit_region = y;
++	  return new_region (x, region, IF_THEN_ELSE_REGION, branch_info);
++	}
++      else
++	{
++	  region_details_u * branch_info =
++	    xmalloc (sizeof (struct diamond_region_s));
++	  branch_info->diamond_region.first_region = y;
++	  branch_info->diamond_region.second_region = z;
++	  return new_region (x, region, DIAMOND_REGION, branch_info);
++	}
++    }
++
++  return NULL;
++}
++
++/* This function attempts to discover if X is single arm of a case
++   statement.  X must have two or more preds.
++
++   The preds can fall into three categories:
++
++   1) simple case - a pred that consists of an empty basic block Y
++   with the COND_NODE as its single pred.
++
++   2) non empty case - a pred that consists of a non empty basic
++   block Y with the COND_NODE as its single pred.
++
++   3) drop into case - a pred Y that has more than a single pred.  It
++   may or may not be empty.
++
++   All of the cases except for possibly one must be simple cases.  If
++   all of the cases are not simple, the remaining one can be either a
++   non empty case or drop into case.
++*/
++
++static int
++discover_case_tree (basic_block cond_node,
++		    basic_block x,
++		    basic_block * result_vec,
++		    int start_index,
++		    bitmap region,
++		    bitmap found)
++{
++  bitmap_iterator bi;
++  struct bb_temp *x_info = (struct bb_temp *)x->aux;
++  int armcount = bitmap_count_bits (x_info->visible_preds);
++  basic_block * preds =
++    (basic_block*)alloca ((size_t)(armcount * sizeof (basic_block)));
++  int divided_case_case_index = -1;
++  int last_simple_case_index = -1;
++  int non_empty_case_index = -1;
++  int i = 0;
++  unsigned int y_index;
++  unsigned int simple_case_count = 0;
++
++  bitmap_set_bit (found, x_info->index);
++
++  /* Go thru all of the preds of x and characterize each of case
++     arms.  */
++  EXECUTE_IF_SET_IN_BITMAP(x_info->visible_preds, 0, y_index, bi)
++    {
++      basic_block y = nodes_in_postord [y_index];
++      struct bb_temp *y_info = (struct bb_temp *)y->aux;
++      preds[i] = y;
++
++      /* Sanity check.  */
++      if (!bitmap_bit_p (region, y_index))
++	return -1;
++
++      /* Check to see that the pred of pred is really the cond
++	 node.  */
++      if (bitmap_count_bits (y_info->visible_preds) == 1)
++	{
++	  unsigned int z_index =
++	    bitmap_first_set_bit (y_info->visible_preds);
++	  basic_block z = nodes_in_postord [z_index];
++	  if (z == cond_node)
++	    {
++	      /* If y is empty, this is most likely the a critical
++		 block inserted after the cond node.  */
++	      if (block_empty_p (y) && single_block_region_p (y))
++		{
++		  ++simple_case_count;
++		  last_simple_case_index = i;
++		}
++	      else
++		{
++		  /* There can only be one y that has code in it or
++		     this is not a valid arm.  */
++		  if (non_empty_case_index == -1)
++		    non_empty_case_index = i;
++		  else
++		    return -1;
++		}
++	    }
++	  else
++	    return -1;
++	  bitmap_set_bit (found, y_index);
++	}
++      else
++	{
++	  /* This is a drop into case.  There can only be one of these. */
++	  if (divided_case_case_index == -1)
++	    divided_case_case_index = i;
++	  else
++	    return -1;
++	}
++
++      /* Cannot branch out of the switch statement.  */
++      if (bitmap_count_bits (y_info->visible_succs) != 1)
++	return -1;
++      i++;
++    }
++  
++  /* There can be at most one of the preds of x that has code in
++     it.  */
++  if ((non_empty_case_index != -1)
++      && (divided_case_case_index != -1))
++    return -1;
++  else {
++    
++    /* If there is one simple case, it is just a simple case.  If there
++       is more than one simple case, then this is a stack of lables onto
++       a single case.  Must collapse that set of lables into a
++       JOINT_CASE_REGION.  */
++    bitmap case_region = BITMAP_ALLOC (&transient_region_obstack);
++    region_details_u * region_info =
++      xmalloc (sizeof (struct complex_case_region_s));
++    int j = simple_case_count - 1;
++    region_info->complex_case_region.entry_case_count = simple_case_count;
++    region_info->complex_case_region.entry_cases =
++      xcalloc (simple_case_count, sizeof (basic_block));
++    region_info->complex_case_region.case_region = x;
++    
++    /* Here is a stack of labels all pointing to the same
++       case.  */
++    for (i=0; i<armcount; i++)
++      {
++	if ((i != divided_case_case_index)
++	    && (i != non_empty_case_index))
++	  {
++	    basic_block y = preds[i];
++	    struct bb_temp *y_info = (struct bb_temp *)y->aux;
++	    region_info->complex_case_region.entry_cases[j--] = y;
++	    bitmap_set_bit (case_region, y_info->index);
++	  }
++      }
++    
++    /* This is a little bit odd if this has a stack of labels.  We
++       just choose one at random as the entry of the region.  */
++    result_vec[start_index] = 
++      new_region (preds[last_simple_case_index],
++		  case_region, COMPLEX_CASE_REGION, region_info);
++  
++  
++    if (non_empty_case_index != -1)
++      {
++	/* These are the top two cases of a drop thru stack.  The
++	   empty one is the second case (added to vec above) and the
++	   one with code drops into it. */
++	result_vec[start_index + 1] = preds[non_empty_case_index];
++	region_info->complex_case_region.previous_region = 
++	  preds[non_empty_case_index];
++	return start_index + 2;
++      }
++    else if (divided_case_case_index != -1)
++      {
++	/* This is the interior of a stack of cases.  The case that was
++	   dropped into was processed here, and the other arm drops into
++	   this and is processed recursively.  */
++	int result_index = discover_case_tree (cond_node,
++					       preds[divided_case_case_index],
++					       result_vec,
++					       start_index + 1,
++					       region,
++					       found);
++	/* Grab the region that was parsed next as the previous_region.  */
++	if (result_index != -1)
++	  region_info->complex_case_region.previous_region 
++	    = result_vec[start_index + 1];
++	return result_index;
++      }
++    else 
++      {
++	/* All of the cases were simple.  This was simply a block of
++	   labels stacked on a single case.  */
++	region_info->complex_case_region.previous_region = NULL;
++	return start_index + 1;
++      }
++    
++  }
++}
++
++/* X is a merge point.  Fill in RESULT_VEC with the set of cases that
++   reach that merge point.  The cases are organized as a set of lists
++   separated by NULL. The last list is terminated with two NULLS.  */
++static int
++discover_case_trees (basic_block cond_node,
++		     basic_block x,
++		     basic_block * result_vec,
++		     bitmap region,
++		     bitmap found)
++{
++  bitmap_iterator bi;
++  struct bb_temp *x_info = (struct bb_temp *)x->aux;
++  struct bb_temp *cn_info = (struct bb_temp *)cond_node->aux;
++  int i;
++  unsigned int lists_found = 0;
++  unsigned int y_index;
++
++  i = 0;
++  EXECUTE_IF_SET_IN_BITMAP(x_info->visible_preds, 0, y_index, bi)
++    {
++      basic_block y = nodes_in_postord [y_index];
++      struct bb_temp *y_info = (struct bb_temp *)y->aux;
++      if (bitmap_bit_p (region, y_info->index))
++	{
++	  if (bitmap_count_bits (y_info->visible_preds) == 1)
++	    {
++	      /* Make sure the pred of the pred of x is the cond node.  */
++	      if (bitmap_bit_p (y_info->visible_preds, cn_info->index))
++		{
++		  /* Regular case with no drop thru.  */
++		  result_vec[i++] = y;
++		  bitmap_set_bit (found, y_index);
++		}
++	      else
++		return -1;
++	    }
++	  else
++	    {
++	      /* Look for a stack of cases that fall into each other.  */
++	      i = discover_case_tree(cond_node,
++				     y,
++				     result_vec, i,
++				     region,
++				     found);
++	      if (i == -1)
++		return -1;
++	    }
++	  /* Add a null to separate the cases.  */
++	  result_vec[i++] = NULL;
++	  lists_found++;
++	}
++    }
++
++  result_vec[i++] = NULL;
++  return lists_found;
++}
++
++/* LISTS contains COUNT vectors of basic blocks separated by NULLS.
++   This function counts the size of each vector, puts that number
++   number in a slot in CASE_COUNT, then allocates a copy of the vector
++   and puts that into CASES.  */
++
++static void
++build_case_vecs (basic_block * lists,
++		 int num_lists,
++		 unsigned int * case_count,
++		 basic_block ** cases,
++		 bitmap top_level_blocks,
++		 bitmap new_region)
++{
++  int i;
++  int index = 0;
++  
++  for (i = 0; i < num_lists; i++)
++    {
++      basic_block * vec;
++      int count = 0;
++      int j;
++      int k;
++      
++      while (lists[index])
++	{
++	  count++;
++	  index++;
++	}
++      
++      case_count[i] = count;
++      vec = xcalloc (count, sizeof (basic_block));
++      cases[i] = vec;
++      
++      /* Need to reverse the vec while copying it because the case
++	 with the break is the first one discovered, and the rest were
++	 found from there.  */
++      for (j = 0, k=index-1; j<count; j++, k--)
++	{
++	  basic_block x = lists[k];
++	  struct bb_temp *x_info = (struct bb_temp *)x->aux;
++	  vec[j] = x;
++	  gcc_assert (vec[j]);
++	  
++	  /* Add the case to the new region.  */
++	  bitmap_set_bit (new_region, x_info->index);
++	  if (get_region_type (x) == COMPLEX_CASE_REGION)
++	    /* Need to remove the nodes within the
++	       COMPLEX_CASE_REGIONs out of the blocks_in_region for
++	       the region that the switch was in
++	       (top_level_blocks).  */
++	    bitmap_and_compl_into (top_level_blocks, x_info->blocks_in_region);
++	}
++      
++      /* Get past the NULL separator.  */
++      index++;
++    }
++}
++
++/* Scan thru LIST (of SIZE) deallocating all of the
++   COMPLEX_CASE_REGIONS.  This is called when we discover that what we
++   hoped was a case statement was not really a case statement and we
++   have to unwind. */
++static void
++cleanup_case_vector (basic_block *list, 
++		     int size, 
++		     basic_block cond_node, 
++		     basic_block sink_node,
++		     unsigned int saved_next_bitmap_index,
++		     int saved_next_region_index)
++{
++  int i;
++  struct bb_temp *cn_info = (struct bb_temp *)cond_node->aux;
++  struct bb_temp *sn_info = (struct bb_temp *)sink_node->aux;
++  basic_block top_level = cond_node->parent_region;
++  struct bb_temp *top_info = (struct bb_temp *)top_level->aux;
++  bitmap_iterator bi;
++  unsigned int y_index;
++  bitmap b_temp = BITMAP_ALLOC (&transient_region_obstack);
++
++  /* Reset the next_bitmap_index and the next_region_index so that it
++     looks like nothing happened.  */
++  next_bitmap_index = saved_next_bitmap_index;
++  next_region_index = saved_next_region_index;
++
++  /* Remove the COMPLEX_CASE_REGIONs from the sink_nodes visible_pred set.  */
++  bitmap_copy (b_temp, sn_info->visible_preds);
++  EXECUTE_IF_SET_IN_BITMAP(b_temp, 0, y_index, bi)
++    {
++      basic_block y = nodes_in_postord [y_index];
++      /* Must check that the index is one that was allocated recently
++	 since the sink_node can be shared by several nested case
++	 statements.  */
++      if (y_index >= saved_next_bitmap_index 
++	  && get_region_type (y) == COMPLEX_CASE_REGION)
++	{
++	  region_details_u * yrd = y->region_info->region_details;
++	  basic_block ycr = yrd->complex_case_region.case_region;
++	  struct bb_temp *cr_info = (struct bb_temp *)ycr->aux;
++	  bitmap_clear_bit (sn_info->visible_preds, y_index);
++	  bitmap_set_bit (sn_info->visible_preds, cr_info->index);
++	}
++    }
++
++  for (i=0; i<size; i++)
++    {
++      basic_block y = list[i];
++      if (y && get_region_type (y) == COMPLEX_CASE_REGION)
++	{
++	  struct bb_temp *y_info = (struct bb_temp *)y->aux;
++	  region_details_u * yrd = y->region_info->region_details;
++	  int count = yrd->complex_case_region.entry_case_count;
++	  basic_block * vec = yrd->complex_case_region.entry_cases;
++	  basic_block ycr = yrd->complex_case_region.case_region;
++	  struct bb_temp *ycr_info = (struct bb_temp *)ycr->aux;
++	  basic_block previous_region = yrd->complex_case_region.previous_region;
++	  int j;
++
++	  bitmap_clear_bit (cn_info->visible_succs, y_info->index);
++	  for (j=0; j<count; j++)
++	    {
++	      basic_block x = vec[j];
++	      struct bb_temp *x_info = (struct bb_temp *)x->aux;
++	      x->parent_region = top_level;
++	      bitmap_set_bit (top_info->blocks_in_region, x_info->index);
++	      bitmap_set_bit (cn_info->visible_succs, x_info->index);
++	    }
++
++	  /* Fix up the visible_succs field of the case that drops
++	     into this one.  */
++	  if (previous_region)
++	    {
++	      basic_block z;
++	      struct bb_temp *z_info;
++	      struct bb_temp *ycr_info = (struct bb_temp *)ycr->aux;
++
++	      /* This is safe because the stacks of cases are still
++		 backwards.  */
++	      if (get_region_type (previous_region) == COMPLEX_CASE_REGION)
++		{
++		  region_details_u * zrd = 
++		    previous_region->region_info->region_details;
++		  z = zrd->complex_case_region.case_region;
++		}
++	      else
++		z = previous_region;
++
++	      z_info = (struct bb_temp *)z->aux;
++
++	      bitmap_clear_bit (z_info->visible_succs, y_index);
++	      bitmap_set_bit (z_info->visible_succs, ycr_info->index);
++	    }
++
++	  ycr->parent_region = top_level;
++	  bitmap_set_bit (top_info->blocks_in_region, ycr_info->index);
++	  
++	  free (vec);
++	  y->region_info->region_details->complex_case_region.entry_cases = NULL;
++	  free (yrd);
++	  y->region_info = NULL;
++	}
++    }
++  BITMAP_FREE (b_temp);
++}
++
++/* Possible SWITCH.  There are a large number of switch styles that
++   are allowed in programs.  The question here is are there any
++   advantages in trying to distinguish them.
++
++   We allow two deviations from the classic switch:
++   1) fall thrus to the next case.
++   2) exit out of an enclosing loop.
++
++   We currently do not allow multiple drop outs that branch to other
++   places after the switch.  This is difficult to distinguish from
++   just an n-way branch.  It may be that we wish to detect this in the
++   future by some rule that forces the majority of exits to one place
++   and some minority to go elsewhere but this becomes hit or miss.
++
++   This code is a little complex because all critical edges have been
++   split.  This makes the fallthur case more complex because the case
++   that it falls into has an extra node in front of it, but otherwise
++   keeps things simple.
++*/
++static basic_block
++new_multibranch (basic_block x, bitmap blocks_in_parent)
++{
++  /* We allow switch statements where one case can drop into the next
++     case.  Case statements can have two structures:
++
++     1) The pure switch statement has no dropthrus.
++
++     2) Every case of the switch either drops to the next or has a
++     case drop into it.
++
++     3) Mixture of (1) and (2).
++
++     There are two other types of exits that are allowed: loop exits
++     and returns.  A loop exit looks like the conditional branching to
++     a node that is not in this region.  A return loops like some
++     branch free path that reaches the EXIT_BLOCK_PTR.
++ */
++  struct bb_temp *x_info = (struct bb_temp *)x->aux;
++  unsigned int x_index = x_info->index;
++  int armcount = bitmap_count_bits (x_info->visible_succs);
++  int vec_size = (armcount * 2) + 1;
++  basic_block merge_point = NULL;
++  bitmap region = BITMAP_ALLOC (&transient_region_obstack);
++  bitmap succ2 = BITMAP_ALLOC (&transient_region_obstack);
++  bitmap succ3 = BITMAP_ALLOC (&transient_region_obstack);
++  bitmap found;
++
++  bitmap_iterator bi;
++  bool rescan_for_exits = false;
++  unsigned int succ2_branches = 0;
++  unsigned int y_index;
++
++  basic_block * exit_list =
++    (basic_block*)alloca ((size_t)(armcount *sizeof (basic_block)));
++  int exit_count = 0;
++
++  basic_block * regular_lists =
++    (basic_block*)alloca ((size_t)(vec_size * sizeof (basic_block)));
++  int regular_count = 0;
++
++  basic_block * return_lists =
++    (basic_block*)alloca ((size_t)(vec_size * sizeof (basic_block)));
++  int return_count = 0;
++  region_details_u * switch_info = NULL;
++  unsigned int succ2_size;
++  unsigned int succ3_size;
++  unsigned int return_path_count = 0;
++
++  /* Save the next_bitmap_index and next_region_index.  If we have to
++     bail, we rest it so it looks like nothing ever happened.  */
++  unsigned int saved_next_bitmap_index = next_bitmap_index;
++  int saved_next_region_index = next_region_index;
++
++  /* If x is not in the root, then any cases that end with a return
++     are not in this region.  */ 
++  struct bb_temp *root_info = (struct bb_temp *)ROOT_BLOCK_PTR->aux;
++
++  /* It is possible to get into a into an infinite loop for switches
++     that have only exits from the loop.  */
++  if (get_region_type (x) == SWITCH_REGION)
++    return NULL;
++
++  memset (regular_lists, 0, (size_t)(vec_size *sizeof (basic_block)));
++  memset (return_lists, 0, (size_t)(vec_size *sizeof (basic_block)));
++
++  x_info->num_path = 0;
++
++  EXECUTE_IF_SET_IN_BITMAP(x_info->visible_succs, 0, y_index, bi)
++    {
++      basic_block y = nodes_in_postord [y_index];
++      struct bb_temp *y_info = (struct bb_temp *)y->aux;
++
++      /* While critical edges have been split in the cfg, we could
++	 still have this be true.  This could happen if x has already
++	 been reduced to an IF_THEN_EXIT or an IF-EXIT_ELSE
++	 region.  */
++      if (bitmap_count_bits (y_info->visible_preds) != 1)
++	{
++	  BITMAP_FREE (region);
++	  BITMAP_FREE (succ2);
++	  BITMAP_FREE (succ3);
++	  return NULL;
++	}
++
++      if (bitmap_bit_p (blocks_in_parent, y_index))
++	switch (bitmap_count_bits (y_info->visible_succs))
++	  {
++	  case 0:
++	    if (y == EXIT_BLOCK_PTR)
++	      {
++		/* If the exit block is in succ1, it means that this is
++		   the only return from the function or else the edge
++		   would have been split and we would not be here.  Mark
++		   the edge and continue.  */
++		exit_list[exit_count++] = y;
++	      }
++	    else
++	      {
++		BITMAP_FREE (region);
++		BITMAP_FREE (succ2);
++		BITMAP_FREE (succ3);
++		return NULL;
++	      }
++	    break;
++	  case 1:
++	    {
++	      unsigned int z_index =
++		bitmap_first_set_bit (y_info->visible_succs);
++	      basic_block z = nodes_in_postord [z_index];
++	      struct bb_temp *z_info = (struct bb_temp *)z->aux;
++
++	      bitmap_set_bit (region, y_index);
++	      if (z == EXIT_BLOCK_PTR)
++		rescan_for_exits = true;
++	      else
++		bitmap_set_bit (succ2, z_index);
++
++	      /* If the number of successors of z is not 1, this may
++		 not be a case statement but we cannot tell until
++		 later.  One node may be allowed to have more than one
++		 successor, but only if the merge point is in succ2.
++
++		 What we do know is that those successors of z are
++		 not going to be in succ3 so there is no reason to
++		 even look at them. */
++	      if (bitmap_count_bits (z_info->visible_succs) == 1)
++		{
++		  unsigned int q_index =
++		    bitmap_first_set_bit (z_info->visible_succs);
++		  bitmap_set_bit (succ3, q_index);
++		}
++	      else
++		succ2_branches++;
++	    }
++	    break;
++	    /* Cannot have conditional branches inside an arm unless
++	       they were reduced.  */
++	  default:
++	    BITMAP_FREE (region);
++	    BITMAP_FREE (succ2);
++	    BITMAP_FREE (succ3);
++	    return NULL;
++	  }
++      else
++      	{
++	  /* This case exits the loop we are in.  We allow this, just
++	     mark the case and continue.  */
++	  exit_list[exit_count++] = y;
++	}
++    }
++
++  if (succ2_branches > 1)
++    {
++      BITMAP_FREE (region);
++      BITMAP_FREE (succ2);
++      BITMAP_FREE (succ3);
++      return NULL;
++    }
++
++
++  /* All of the nodes in the switch are in succ1 U succ2 U succ3.
++     However, succ3 may have other nodes: nodes that reach the exit
++     block and nodes that are out edges from the merge point. */
++  found = BITMAP_ALLOC (&transient_region_obstack);
++
++  bitmap_set_bit (region, x_index);
++  bitmap_ior_into (region, succ2);
++  bitmap_ior_into (region, succ3);
++
++  /* We found an exit block.  We need to find all of the blocks in
++     the region that reach the exit and remove those cases before
++     proceeding any further. If we found some exit blocks, we need
++     remove anything in succ2 or succ3 that can reach the
++     EXIT_BLOCK_PTR. */
++  if (rescan_for_exits)
++    {
++      struct bb_temp *eb_info = (struct bb_temp *)EXIT_BLOCK_PTR->aux;
++      int i, j;
++      return_count = discover_case_trees (x,
++					  EXIT_BLOCK_PTR,
++					  return_lists,
++					  region,
++					  found);
++      if (return_count == -1)
++	{
++	  cleanup_case_vector (return_lists, vec_size, x, 
++			       EXIT_BLOCK_PTR, 
++			       saved_next_bitmap_index,
++			       saved_next_region_index);
++	  BITMAP_FREE (succ2);
++	  BITMAP_FREE (succ3);
++	  BITMAP_FREE (region);
++	  BITMAP_FREE (found);
++	  return NULL;
++	}
++
++      /* Count the number of actual cases found.  */
++      j = 0;
++      for (i = 0; i< return_count; i++)
++	{
++	  while (return_lists[j])
++	    {
++	      j++;
++	      return_path_count++;
++	    }
++	  j++;
++	}
++
++      bitmap_and_compl_into (succ2, found);
++      bitmap_and_compl_into (succ3, found);
++      bitmap_and_compl_into (region, found);
++      /* Clear the exit block from found.  */
++      bitmap_clear_bit (found, eb_info->index);
++    }
++
++  /* Set up te number of preds in region.  */
++  EXECUTE_IF_SET_IN_BITMAP(region, 0, y_index, bi)
++    {
++      basic_block y = nodes_in_postord [y_index];
++      struct bb_temp *y_info = (struct bb_temp *)y->aux;
++      unsigned int z_index;
++      bitmap_iterator bi2;
++
++      int p_count = 0;
++      EXECUTE_IF_SET_IN_BITMAP(y_info->visible_preds, 0, z_index, bi2)
++	{
++	  if (bitmap_bit_p (region, z_index))
++	    p_count++;
++	}
++      y_info->num_pred_in_set = p_count;
++    }
++
++  /*
++     1) if |succ2| + |succ3| = 0 there is no merge point.  This can
++     happen if all of the cases return or exit the loop.
++     2) if |succ2| == 1 the merge point is this singleton.
++     3) if |succ3| == 1 the merge point is this singleton.
++     4) find a node with as many paths into it as there are cases
++     out of the brank.
++
++     notes:
++
++     (1) if all of the case arms either exit the loop or return, this
++     is still a switch statement.
++     (2) this case corresponds to a pure case statement, no fall
++     thurs.
++     (3) this is the case where every case with a break has exactly 1
++     fallthru that reaches it.
++
++     (4) the merge point can be found by doing 2 searchs.  The first
++     search, which was already done, builds the set region which is
++     just succ1 + succ2 + succ3.  Another BFS can tag each node z in
++     region with the number of paths from Head to z that stay in
++     region.  Paths more than 3 edges long are counted but not
++     followed.
++
++     The searches use 2 separate counters for each node y:
++     y.num_pred_in_set and y.num_path.
++
++     Second BFS does a topological sort of region and incidentally
++     detects some of the nastiness that can keep us from having a
++     Switch.  Will gloss over detecting nastiness for this sketch.
++
++     Use a FIFO queue of nodes, initially with just Head.
++     When we take y off the queue:
++
++     (4a) we set y.num_path to the sum of all p.num_path for p a
++     predecessor of y.
++
++     (4b) We also loop over successors of y.  If a successor z is in
++     region, then we decrement z.num_pred_in_set.  If this process
++     makes z.num_pred_in_set become 0, then we put z on the queue.
++     With the exception of the switch cond and the merge node, it is
++     expected that there is just one successor.  This is checked
++     elsewhere.
++
++     (4c) The mergepoint may have both preds and succs that are not in
++     region.  X will have all of its preds outside reach 3 and my have
++     succs that are not in region (however these succs have been
++     processed out in the above code.)  If any other edge is found
++     outside region, this is not a switch statement.
++
++     Eventually, we may compute a z.num_path value that is exactly
++     equal to the number of successors of Head.  As soon as this
++     happens, we will know that z is the sink of the Switch (if we
++     have a Switch at all).
++  */
++
++  succ2_size = bitmap_count_bits (succ2);
++  succ3_size = bitmap_count_bits (succ3);
++
++  if (succ2_size + succ3_size == 0)
++    /* (1) */
++    merge_point = NULL;
++  if (succ2_size == 1)
++    /* (2) */
++    merge_point = nodes_in_postord[bitmap_first_set_bit (succ2)];
++  else if (succ3_size == 1)
++    /* (3) */
++    merge_point = nodes_in_postord[bitmap_first_set_bit (succ3)];
++  else
++    {
++      basic_block * fifo_queue =
++	(basic_block*)alloca ((size_t)(armcount *sizeof (basic_block)));
++      int fifo_start = 0;
++      int fifo_end = 0;
++      bool this_must_be_merge = false;
++      bool fail = false;
++      int target_path_count =
++	armcount - (exit_count + return_path_count);
++
++      fifo_queue[fifo_end++] = x;
++
++      while (fifo_start < fifo_end)
++	{
++	  basic_block y = fifo_queue[fifo_start++];
++	  struct bb_temp *y_info = (struct bb_temp *)y->aux;
++	  unsigned int z_index;
++	  if (y != x)
++	    {
++	      unsigned int z_index;
++	      y_info->num_path = 0;
++	      /* (4a) */
++	      EXECUTE_IF_SET_IN_BITMAP(y_info->visible_preds, 0, z_index, bi)
++		{
++		  basic_block z = nodes_in_postord [z_index];
++		  struct bb_temp *z_info = (struct bb_temp *)z->aux;
++		  if (z == x)
++		    y_info->num_path += 1;
++		  if (bitmap_bit_p (region, z_index))
++		    y_info->num_path += z_info->num_path;
++		  else
++		    this_must_be_merge = true;
++		}
++	    }
++
++	  /* (4b) */
++	  EXECUTE_IF_SET_IN_BITMAP(y_info->visible_succs, 0, z_index, bi)
++	    {
++	      basic_block z = nodes_in_postord [z_index];
++	      struct bb_temp *z_info = (struct bb_temp *)z->aux;
++	      if (bitmap_bit_p (region, z_index))
++		{
++		  z_info->num_pred_in_set--;
++		  if (z_info->num_pred_in_set == 0)
++		    fifo_queue[fifo_end++] = z;
++		}
++	      else
++		this_must_be_merge = true;
++	    }
++
++	  /* (4c) */
++	  if (y_info->num_path == target_path_count)
++	    {
++	      merge_point = y;
++	      break;
++	    }
++	  else if (this_must_be_merge)
++	    {
++	      fail = true;
++	      break;
++	    }
++	}
++
++      if (fail || !merge_point)
++	{
++	  cleanup_case_vector (return_lists, vec_size, x, 
++			       EXIT_BLOCK_PTR, 
++			       saved_next_bitmap_index,
++			       saved_next_region_index);
++	  BITMAP_FREE (succ2);
++	  BITMAP_FREE (succ3);
++	  BITMAP_FREE (region);
++	  BITMAP_FREE (found);
++	  return NULL;
++	}
++     }
++
++  BITMAP_FREE (succ2);
++  BITMAP_FREE (succ3);
++
++  /* Find the strings of cases associated with each entrance into the
++     merge point. */
++  if (merge_point)
++    {
++      struct bb_temp *mp_info = (struct bb_temp *)merge_point->aux;
++
++      regular_count =
++	discover_case_trees (x, merge_point, regular_lists, region, found);
++
++      if (regular_count == -1)
++	{
++	  cleanup_case_vector (return_lists, vec_size, x, 
++			       EXIT_BLOCK_PTR, 
++			       saved_next_bitmap_index,
++			       saved_next_region_index);
++	  cleanup_case_vector (regular_lists, vec_size, x, 
++			       merge_point, 
++			       saved_next_bitmap_index,
++			       saved_next_region_index);
++	  BITMAP_FREE (found);
++	  BITMAP_FREE (region);
++	  return NULL;
++	}
++
++      /* The merge_point is not in the region.  */
++      bitmap_clear_bit (found, mp_info->index);
++    }
++
++  BITMAP_FREE (found);
++  found = NULL;
++
++
++  /* Build the region. X is part of the region.  */
++  bitmap_clear (region);
++  bitmap_set_bit (region, x_info->index);
++
++  switch_info = xmalloc (sizeof (struct switch_region_s));
++
++  switch_info->switch_region.case_count = armcount;
++
++  /* Regular cases.  */
++  switch_info->switch_region.regular_case_count_count = regular_count;
++  if (regular_count)
++    {
++      switch_info->switch_region.regular_case_counts =
++	xcalloc (regular_count, sizeof (int));
++      switch_info->switch_region.regular_cases =
++	xcalloc (regular_count, sizeof (basic_block*));
++      build_case_vecs (regular_lists, regular_count,
++		       switch_info->switch_region.regular_case_counts,
++		       switch_info->switch_region.regular_cases, 
++		       blocks_in_parent,
++		       region);
++    }
++  else
++    {
++      switch_info->switch_region.regular_case_counts = NULL;
++      switch_info->switch_region.regular_cases = NULL;
++    }
++
++  /* Process returns as exits to cases.  */
++  switch_info->switch_region.return_case_count_count = return_count;
++  if (return_count)
++    {
++      bitmap additional_blocks_at_root = 
++	BITMAP_ALLOC (&transient_region_obstack);
++      /* Any cases that return rather than break are not part of the
++	 case statement region per se.  They really belong to the root
++	 region.  Now it may be the case that X is or is not in the
++	 root region but in fact this does not matter.  All that we
++	 need to do is make sure that these cases are inserted at the
++	 root region level and not left in any other region.  */  
++      switch_info->switch_region.return_case_counts =
++	xcalloc (return_count, sizeof (int));
++      switch_info->switch_region.return_cases =
++	xcalloc (return_count, sizeof (basic_block*));
++      build_case_vecs (return_lists, return_count,
++		       switch_info->switch_region.return_case_counts,
++		       switch_info->switch_region.return_cases, 
++		       root_info->blocks_in_region,
++		       additional_blocks_at_root);
++
++      EXECUTE_IF_SET_IN_BITMAP(additional_blocks_at_root, 0, y_index, bi)
++	{
++	  basic_block y = nodes_in_postord[y_index];
++	  if (y->parent_region)
++	    remove_from_current_region (y);
++	  y->parent_region = ROOT_BLOCK_PTR;
++	}
++
++      bitmap_ior_into (root_info->blocks_in_region, additional_blocks_at_root); 
++      BITMAP_FREE (additional_blocks_at_root);
++    }
++  else
++    {
++      switch_info->switch_region.return_case_counts = NULL;
++      switch_info->switch_region.return_cases = NULL;
++    }
++
++  /* Loop exit cases.  */
++  switch_info->switch_region.exit_case_count = exit_count;
++  switch_info->switch_region.exit_cases =
++    xcalloc (exit_count, sizeof (basic_block));
++  memcpy (switch_info->switch_region.exit_cases,
++	  exit_list,
++	  exit_count * sizeof (basic_block));
++
++  return new_region (x, region, SWITCH_REGION, switch_info);
++}
++
++static void
++dfs_region (basic_block x,
++	    basic_block *region_in_postord,
++	    bitmap region)
++{
++  struct bb_temp *x_info = (struct bb_temp *)x->aux;
++  bitmap_iterator bi;
++  unsigned int y_index;
++  x_info->visited = true;
++
++  EXECUTE_IF_SET_IN_BITMAP(x_info->visible_succs, 0, y_index, bi)
++    {
++      basic_block y = nodes_in_postord[y_index];
++      struct bb_temp *y_info = (struct bb_temp *)y->aux;
++      if (!y_info->visited
++	  && bitmap_bit_p (region, y_index))
++	dfs_region (y, region_in_postord, region);
++    }
++  region_in_postord[s_count] = x;
++  s_count++;
++}
++
++/* Find the simple, acyclic regions of the control tree.  The SWITCH
++   construction used in the figure is as in Pascal and the KornShell:
++   each branch falls through to the end rather than the next branch.
++*/
++
++/* Analyze_structures makes three passes over each loop to reduce the
++   acyclic structures:
++
++   1) Information gathering and construction of the postorder list of
++   nodes in this loop region.  This requires a depth first search of
++   the nodes within the region that ignores the backedges, especially
++   those introduced by colapsing regions.
++
++   2) Reduction of acyclic nodes in this region.
++
++   3) Reduction of inner loops contained in this region.
++
++   It is important to reduce the current loop before touching the
++   contained loops since you want to provide a stable location for the
++   targets of the loop exits of the inner loops.
++*/
++
++static void
++analyze_structures (basic_block x, int depth)
++{
++  struct bb_temp *x_info = (struct bb_temp *)x->aux;
++  int region_size = bitmap_count_bits (x_info->blocks_in_region);
++  basic_block * region_in_postord =
++    (basic_block*)alloca ((size_t)(region_size *sizeof (basic_block)));
++
++  basic_block *inner_loops =
++    (basic_block*)alloca ((size_t)(region_size *sizeof (basic_block)));
++
++  bitmap_iterator bi;
++  int inner_loop_count = 0;
++  unsigned int y_index;
++  int i;
++
++  /* (1) Need to go thru the nodes in the region in postord.  Blocks
++     in region is not quite postord since any collasped regions are at
++     the end.  */
++
++  EXECUTE_IF_SET_IN_BITMAP(x_info->blocks_in_region, 0, y_index, bi)
++    {
++      basic_block y = nodes_in_postord [y_index];
++      struct bb_temp *y_info = (struct bb_temp *)y->aux;
++      y_info->visited = false;
++    }
++
++  r_count = 0;
++  s_count = 0;
++
++  if (get_region_type (x) == IMPROPER_REGION)
++    {
++      int count =
++	x->region_info->region_details->improper_region.entry_count;
++      for (i=0; i<count; i++)
++	dfs_region (x->region_info->region_details->improper_region.entries[i],
++		    region_in_postord,
++		    x_info->blocks_in_region);
++    }
++  else
++    dfs_region (x->region_info->region_head,
++		region_in_postord,
++		x_info->blocks_in_region);
++
++  /* (2) */
++  for (i=0; i<region_size; i++)
++    {
++      basic_block y = region_in_postord[i];
++      struct bb_temp *y_info = (struct bb_temp *)y->aux;
++      basic_block new_region = NULL;
++
++      if (loop_region_p (y))
++	inner_loops [inner_loop_count++] = y;
++
++      do {
++	new_region = NULL;
++	switch (bitmap_count_bits (y_info->visible_succs))
++	  {
++	  case 0:
++	    break;
++	  case 1:
++	    new_region = new_block (y);
++	    break;
++	  case 2:
++	    new_region = new_branch (y, x_info->blocks_in_region);
++	    break;
++	  default:
++	    new_region = new_multibranch (y, x_info->blocks_in_region);
++	    break;
++	  }
++	
++	/* Remove the old blocks from the enclosing region and add the
++	   new region node.  */
++	if (new_region)
++	  {
++	    struct bb_temp *nr_info = (struct bb_temp *)new_region->aux;
++	    if (new_region->parent_region)
++	      remove_from_current_region(new_region->parent_region);
++	    new_region->parent_region = x;
++
++	    bitmap_and_compl_into (x_info->blocks_in_region,
++				   nr_info->blocks_in_region);
++	    bitmap_set_bit (x_info->blocks_in_region, nr_info->index);
++	    y = new_region;
++	    y_info = (struct bb_temp *)y->aux;
++	  }
++      }
++      /* Go around as long as we are collaping regions.  */
++      while (new_region);
++    }
++
++  /* (3) */
++  for (i=0; i<inner_loop_count; i++)
++    analyze_structures (inner_loops[i], depth+1);
++}
++
++
++/* Free the complex case arm structures.  */
++static void
++free_case_info (int count_count, unsigned int * counts, basic_block ** cases)
++{
++  int i;
++  for (i=0; i<count_count; i++)
++    free (cases[i]);
++  free (cases);
++  free (counts);
++}
++
++/* Code to get rid of the structure graph.  */
++
++static void
++clear_bb (basic_block bb)
++{
++  bb->parent_region = NULL;
++  bb->prev_bb_in_region = NULL;
++  bb->next_bb_in_region = NULL;
++
++  if (bb->region_info && bb->region_info->region_details)
++    {
++      switch (get_region_type (bb))
++	{
++	case IMPROPER_REGION:
++	  free (bb->region_info->region_details->improper_region.entries);
++	  break;
++	
++	case SWITCH_REGION:
++	  free_case_info (bb->region_info->region_details->
++			  switch_region.regular_case_count_count,
++			  bb->region_info->region_details->
++			  switch_region.regular_case_counts,
++			  bb->region_info->region_details->
++			  switch_region.regular_cases);
++	  free_case_info (bb->region_info->region_details->
++			  switch_region.return_case_count_count,
++			  bb->region_info->region_details->
++			  switch_region.return_case_counts,
++			  bb->region_info->region_details->
++			  switch_region.return_cases);
++	  free (bb->region_info->region_details->switch_region.exit_cases);
++	  break;
++	
++	case COMPLEX_CASE_REGION:
++	  free (bb->region_info->region_details->complex_case_region.entry_cases);
++	  break;
++
++	default:
++	  break;
++	}
++      if (bb->region_info->region_details)
++	{
++	  free (bb->region_info->region_details);
++	  bb->region_info->region_details = NULL;
++	} 
++      bb->region_info = NULL;
++    }
++
++  free (bb->region_preds);
++  bb->region_preds = NULL;
++  free (bb->region_succs);
++  bb->region_succs = NULL;
++}
++
++static void
++delete_region_node_recursive (basic_block rn)
++{
++  basic_block bb;
++  basic_block last_bb = NULL;
++  FOR_EACH_BB_IN_REGION(bb, rn)
++    {
++      if (last_bb)
++	clear_bb (last_bb);
++      if (!single_block_region_p (bb))
++	delete_region_node_recursive (bb);
++      last_bb = bb;
++    }
++
++  if (last_bb)
++    clear_bb (last_bb);
++}
++
++/* This function deletes the stucture graph from the control flow
++   graph.  */
++
++void
++delete_regions (void)
++{
++  basic_block bb;
++  if (!ROOT_BLOCK_PTR) return;
++
++  delete_region_node_recursive (ROOT_BLOCK_PTR);
++  ROOT_BLOCK_PTR = NULL;
++  n_region_blocks = 0;
++  bitmap_obstack_release (&persistent_region_obstack);
++
++  FOR_ALL_BB (bb)
++    {
++      gcc_assert (!bb->parent_region);
++    }
++}
++
++
++/* Return true if BB is a SINGLE_NODE_REGION.  */
++bool
++single_block_region_p (basic_block bb)
++{
++  return  !bb->region_info;
++}
++
++/* Return the region type of BB.  */
++enum region_type
++get_region_type (basic_block x)
++{
++  if (single_block_region_p (x))
++    return SINGLE_NODE_REGION;
++  else
++    return x->region_info->type;
++}
++
++/* These must be in the same order as enum region_type in
++   basic_block.h.  */
++static const char * const region_type_names[] = {
++  "single_node",
++  "root",
++
++  "improper",
++  "reduced_loop",
++
++  "block",
++
++  "if_exit_else",
++  "if_then_exit",
++  "branch2_exit",
++
++  "if_then_else",
++  "diamond",
++
++  "complex_case",
++  "switch"};
++
++/* Return the region type name of a region type.  */
++const char *
++get_region_type_name (enum region_type rn)
++{
++  return region_type_names[(int)rn];
++}
++
++/* Return true if BB is a loop.  */
++bool
++loop_region_p (basic_block bb)
++{
++  switch (get_region_type (bb))
++    {
++    case IMPROPER_REGION:
++    case REDUCED_LOOP_REGION:
++      return true;
++    default:
++      return false;
++    }
++}
++
++/* Return true if the region is a single entry region.  For some types
++   of regions, this may be dependant on the nodes in the actual
++   region.  The ROOT_REGION is considered a single entry region even
++   if it only has no in edges.  */
++bool 
++single_entry_region_p (basic_block bb)
++{
++  switch (get_region_type (bb))
++    {
++    case SINGLE_NODE_REGION:
++    case BLOCK_REGION:
++    case REDUCED_LOOP_REGION:
++    case IF_EXIT_ELSE_REGION:
++    case IF_THEN_EXIT_REGION:
++    case BRANCH2_EXIT_REGION:
++    case IF_THEN_ELSE_REGION:
++    case DIAMOND_REGION:
++    case SWITCH_REGION:
++      gcc_assert (bb->num_region_preds == 1);
++      return true;
++
++    case ROOT_REGION:
++      gcc_assert (bb->num_region_preds == 0);
++      return true;
++
++    case IMPROPER_REGION:
++    case COMPLEX_CASE_REGION:
++      return false;
++    default:
++      gcc_assert (false);
++    }
++}
++
++/* Return true if the region is a single entry region.  For some types
++   of regions, this may be dependant on the nodes in the actual
++   region.  The ROOT_REGION is considered a single exit region no
++   matter how many returns it has.  */
++bool 
++single_exit_region_p (basic_block bb)
++{
++  switch (get_region_type (bb))
++    {
++    case SINGLE_NODE_REGION:
++    case BLOCK_REGION:
++    case REDUCED_LOOP_REGION:
++    case IMPROPER_REGION:
++    case SWITCH_REGION:
++      return bb->num_region_succs == 1;
++
++    case IF_THEN_ELSE_REGION:
++    case DIAMOND_REGION:
++    case COMPLEX_CASE_REGION:
++      gcc_assert (bb->num_region_succs == 1);
++    case ROOT_REGION:
++      return true;
++
++    case IF_EXIT_ELSE_REGION:
++    case IF_THEN_EXIT_REGION:
++    case BRANCH2_EXIT_REGION:
++      return false;
++    default:
++      gcc_assert (false);
++    }
++}
++
++/* Return true if BB is not in the region defined by
++   BASIC_BLOCKS_IN_REGION and REGIONS_IN_REGION.  */
++static bool
++block_out_of_region (bitmap basic_blocks_in_region, 
++		     bitmap regions_in_region, 
++		     basic_block bb)
++{
++  if (single_block_region_p (bb))
++    return !bitmap_bit_p (basic_blocks_in_region, bb->index);
++  else
++    return !bitmap_bit_p (regions_in_region, -(bb->index));
++}
++
++
++/* Search all of the basic block BB to find the preds outside of
++   BASIC_BLOCKS_IN_REGION.  */ 
++
++static bool
++check_entry_block (bitmap basic_blocks_in_region,
++		   basic_block bb, 
++		   bitmap blocks, 
++		   bitmap beginning_of_block_p)
++{
++  edge_iterator ei;
++  edge e;
++  bool all_preds_outside_region = true;
++  bool all_preds_inside_region = true;
++  FOR_EACH_EDGE (e, ei, bb->preds)
++    {
++      basic_block y = e->src;
++      if (bitmap_bit_p (basic_blocks_in_region, y->index))
++	all_preds_outside_region = false;
++      else
++	all_preds_inside_region = false;
++    }
++
++  if (dump_file)
++    fprintf (dump_file, "check_entry_region=%d all_preds_in=%u all_preds_out=%u\n", 
++	     bb->index,
++	     all_preds_inside_region,
++	     all_preds_outside_region);
++  /* If all of the preds are outside the region, then code can be
++     inserted at the end of this block.  Otherwise the insertion
++     points are the ends of the preds that are outside the region.  */
++  if (all_preds_outside_region)
++    {
++      bitmap_set_bit (blocks, bb->index);
++      bitmap_set_bit (beginning_of_block_p, bb->index);
++    }
++  else if (!all_preds_inside_region)
++    FOR_EACH_EDGE (e, ei, bb->preds)
++      {
++	basic_block y = e->src;
++	if (!single_succ_p (y))
++	  {
++	    if (dump_file)
++	      fprintf (dump_file, 
++		       "abandoning search because of bad edge %d->%d\n", 
++		       y->index,
++		       bb->index);
++	    /* Y is not a suitable place to insert code because it may
++	       exit to other blocks.  This can only happen because an
++	       edge was not split.  */
++	    return false;
++      }
++	if (!bitmap_bit_p (basic_blocks_in_region, y->index))
++	  bitmap_set_bit (blocks, y->index);
++      }  
++  return true;
++}
++
++/* Search all of the blocks in BB to find the blocks with preds
++   outside of BASIC_BLOCKS_IN_REGION.  */ 
++static bool 
++check_entry_region (bitmap basic_blocks_in_region,
++		    bitmap regions_in_region,
++		    basic_block bb, 
++		    bitmap blocks, 
++		    bitmap beginning_of_block_p)
++{
++  if (single_block_region_p (bb))
++    return check_entry_block (basic_blocks_in_region, 
++			      bb, blocks, beginning_of_block_p);
++  else
++    {
++      basic_block x;
++      FOR_EACH_BB_IN_REGION (x, bb)
++	{
++	  if (single_block_region_p (x))
++	    {
++	      if (!check_entry_block (basic_blocks_in_region, 
++				      x, blocks, beginning_of_block_p))
++		return false;
++	    }
++	  else
++	    {
++	      int i;
++	      for (i=0; i<x->num_region_preds; i++)
++		{
++		  /* Check pred y of region x to see if it exits the
++		     top level region.  If it does, dive down and tear
++		     apart that region.  */
++		  basic_block y = x->region_preds[i];
++		  if (block_out_of_region (basic_blocks_in_region, 
++					   regions_in_region, 
++					   y))
++		    {
++		      if (!get_real_entry_blocks_1(basic_blocks_in_region, 
++						   regions_in_region,
++						   x, blocks, beginning_of_block_p))
++			return false;
++		      break;
++		    }
++		}
++	    }
++	}
++    }
++  return true;
++}
++
++/* Internal function to support get_real_entry_blocks.  This function
++   is recursive so that see into the regions of regions to find only
++   real basic blocks.  For each bit  */
++static bool
++get_real_entry_blocks_1 (bitmap basic_blocks_in_region,
++			 bitmap regions_in_region,
++			 basic_block bb, 
++			 bitmap blocks, 
++			 bitmap beginning_of_block_p)
++{
++  switch (get_region_type (bb))
++    {
++    case SINGLE_NODE_REGION:
++      return check_entry_block (basic_blocks_in_region, 
++				bb, blocks, beginning_of_block_p);
++      break;
++      
++    case ROOT_REGION:
++      {
++	edge_iterator ei;
++	edge e;
++	FOR_EACH_EDGE (e, ei, BASIC_BLOCK (ENTRY_BLOCK)->succs)
++	  {
++	    basic_block y = e->dest;
++	    bitmap_set_bit (blocks, y->index);
++	    bitmap_set_bit (beginning_of_block_p, y->index);
++	  }
++	return true;
++      }
++      break;
++      
++    case BLOCK_REGION:
++    case IF_EXIT_ELSE_REGION:
++    case IF_THEN_EXIT_REGION:
++    case BRANCH2_EXIT_REGION:
++    case IF_THEN_ELSE_REGION:
++    case DIAMOND_REGION:
++    case SWITCH_REGION:
++      /* For these regions, the entries are well defined.  All of the
++	 edges into the entry, enter from the outside.  Thus, we can
++	 just recurse on the entry node. */
++      return get_real_entry_blocks_1 (basic_blocks_in_region, 
++				      regions_in_region,
++				      bb->region_info->region_head, 
++				      blocks, beginning_of_block_p);
++      break; 
++
++
++      /* The loops have two or more edges into them.  At least one is
++	 from inside the region and at least one is from outside the
++	 region.  */
++    case REDUCED_LOOP_REGION:
++      return check_entry_region (basic_blocks_in_region, 
++				 regions_in_region,
++				 bb->region_info->region_head, 
++				 blocks, beginning_of_block_p);
++      break;
++
++    case IMPROPER_REGION:
++      {
++	region_details_u * bbrd = bb->region_info->region_details;
++	int i;
++	int count = bbrd->improper_region.entry_count;
++	basic_block * entries = bbrd->improper_region.entries;
++	for (i=0; i<count; i++)
++	  {
++	    bool result =
++	      check_entry_region (basic_blocks_in_region,
++				  regions_in_region,
++				  entries[i], blocks, 
++				  beginning_of_block_p);
++	    if (!result)
++	      return false;
++	  }
++	return true;
++      }
++      break;
++      
++    case COMPLEX_CASE_REGION:
++      /* This is just too messy to because of all of the drop into
++	 cases.  Just check every block.  */
++      return check_entry_region (basic_blocks_in_region,
++				 regions_in_region,
++				 bb, blocks, 
++				 beginning_of_block_p);
++      break;
++    }
++  return true;
++}
++
++/* Search all of the basic block BB to find the preds outside of
++   BASIC_BLOCKS_IN_REGION.  */ 
++
++static bool
++check_exit_block (bitmap basic_blocks_in_region,
++		  basic_block bb, 
++		  bitmap blocks, 
++		  bitmap beginning_of_block_p)
++{
++  edge_iterator ei;
++  edge e;
++  bool all_succs_outside_region = true;
++  bool all_succs_inside_region = true;
++  FOR_EACH_EDGE (e, ei, bb->succs)
++    {
++      basic_block y = e->dest;
++      if (bitmap_bit_p (basic_blocks_in_region, y->index))
++	all_succs_outside_region = false;
++      else
++	all_succs_inside_region = false;
++    }
++  /* If all of the succs are outside the region, then code can be
++     inserted at the beginning of this block.  Otherwise the insertion
++     points are the starts of the succs that are outside the
++     region.  */
++  if (dump_file)
++    fprintf (dump_file, "check_exit_block=%d all_succs_in=%u all_succs_out=%u\n",
++	     bb->index,
++	     all_succs_inside_region,
++	     all_succs_outside_region);
++  if (all_succs_outside_region)
++    bitmap_set_bit (blocks, bb->index);
++  else if (!all_succs_inside_region)
++    FOR_EACH_EDGE (e, ei, bb->succs)
++      {
++	basic_block y = e->dest;
++	if (!bitmap_bit_p (basic_blocks_in_region, y->index))
++	  {
++	    if (!single_pred_p (y))
++	      {
++		if (dump_file)
++		  fprintf (dump_file, 
++			   "abandoning search because of bad edge %d->%d\n", 
++			   bb->index,
++			   y->index);
++
++		/* Y is not a suitable place to insert code because it
++		   may be entered from other blocks.  This can only
++		   happen because an edge was not split.  */
++		return false;
++	      }
++	    bitmap_set_bit (blocks, y->index);
++	    bitmap_set_bit (beginning_of_block_p, y->index);
++	  }
++      }  
++  return true;
++}
++
++/* Search all of the blocks in BB to find the blocks with succs
++   outside of BASIC_BLOCKS_IN_REGION.  */ 
++static bool
++check_exit_region (bitmap basic_blocks_in_region,
++		   bitmap regions_in_region,
++		   basic_block bb, 
++		   bitmap blocks, 
++		   bitmap beginning_of_block_p)
++{
++  
++  if (single_block_region_p (bb))
++    return check_exit_block (basic_blocks_in_region, 
++			     bb, blocks, beginning_of_block_p);
++  else
++    {
++      basic_block x;
++      FOR_EACH_BB_IN_REGION (x, bb)
++	{
++	  if (single_block_region_p (x))
++	    {
++	      if (!check_exit_block (basic_blocks_in_region, 
++				    x, blocks, beginning_of_block_p))
++		return false;
++	    }
++	  else
++	    {
++	      int i;
++	      for (i=0; i<x->num_region_succs; i++)
++		{
++		  /* Check each succ, y, of region x to see if any y
++		     exits the top level region.  If any one does,
++		     dive down and tear apart x.  */
++		  basic_block y = x->region_succs[i];
++
++		  if (block_out_of_region (basic_blocks_in_region, 
++					   regions_in_region, 
++					   y))
++		    {
++		      if (!get_real_exit_blocks_1(basic_blocks_in_region, 
++						  regions_in_region,
++						  x, blocks, beginning_of_block_p))
++			return false;
++		      break;
++		    }
++		}
++	    }
++	}
++    }
++  return true;
++ }
++
++/* Internal function to support get_real_exit_blocks.  This function
++   is recursive so that see into the regions of regions to find only
++   real basic blocks.  Returns false if the function fails.  */
++static bool
++get_real_exit_blocks_1 (bitmap basic_blocks_in_region,
++			bitmap regions_in_region,
++			basic_block bb, 
++			bitmap blocks, 
++			bitmap beginning_of_block_p)
++{
++  switch (get_region_type (bb))
++    {
++    case SINGLE_NODE_REGION:
++      return check_exit_block (basic_blocks_in_region, 
++			       bb, blocks, beginning_of_block_p);
++      break;
++      
++    case ROOT_REGION:
++      {
++	edge_iterator ei;
++	edge e;
++	FOR_EACH_EDGE (e, ei, BASIC_BLOCK (EXIT_BLOCK)->preds)
++	  {
++	    basic_block y = e->dest;
++	    bitmap_set_bit (blocks, y->index);
++	  }
++	return true;
++      }
++      break;
++      
++      /* The following three cases require some combination of the top
++	 of a block outside the region and the bottom of a block
++	 inside the region.  */
++    case REDUCED_LOOP_REGION:
++    case IMPROPER_REGION:
++    case COMPLEX_CASE_REGION:
++    case IF_EXIT_ELSE_REGION:
++    case IF_THEN_EXIT_REGION:
++    case BRANCH2_EXIT_REGION:
++    case SWITCH_REGION:
++    case BLOCK_REGION:
++      return check_exit_region (basic_blocks_in_region, 
++				regions_in_region,
++				bb, blocks, beginning_of_block_p);
++      break;
++      
++      /* The following two cases have clean exit structures, i.e all
++	 of the out edges come from well defined blocks that whose
++	 edges only leave the region.  */
++    case IF_THEN_ELSE_REGION:
++      {
++	region_details_u * bbrd = bb->region_info->region_details;
++        bool result = 
++	  get_real_exit_blocks_1 (basic_blocks_in_region, 
++				  regions_in_region,
++				  bbrd->if_then_else_region.then_region, 
++				  blocks, beginning_of_block_p);
++	if (!result) 
++	  return false;
++	
++	return get_real_exit_blocks_1 (basic_blocks_in_region, 
++				       regions_in_region,
++				       bbrd->if_then_else_region.else_region, 
++				       blocks, beginning_of_block_p);
++      }
++      break;
++      
++    case DIAMOND_REGION:
++      {
++	region_details_u * bbrd = bb->region_info->region_details;
++        bool result = 
++	  get_real_exit_blocks_1 (basic_blocks_in_region, 
++				  regions_in_region,
++				  bbrd->diamond_region.first_region, 
++				  blocks, beginning_of_block_p);
++	if (!result) 
++	  return false;
++	
++	return get_real_exit_blocks_1 (basic_blocks_in_region, 
++				       regions_in_region,
++				       bbrd->diamond_region.second_region, 
++				       blocks, beginning_of_block_p);
++      }
++      break;
++    }
++  return true;
++}
++
++/* Get the set of real basic blocks (no region nodes are returned)
++   that can be used to insert code at the beginning of REGION.  The
++   indexes if those BLOCKS returned in a bitmap. The corresponding bit
++   in BEGINNING_OF_BLOCK_P is set if the proper insertion point is the
++   beginning of the block.  If false is returned, this function
++   failed.  This failure is generally because the region was either
++   the source or the target of abnormal edges that could not be
++   split.  */
++bool
++get_real_entry_blocks (basic_block region,
++		       bitmap blocks, 
++		       bitmap beginning_of_block_p)
++{
++  bitmap_clear (blocks);
++  bitmap_clear (beginning_of_block_p);
++  if (single_block_region_p (region))
++    {
++      bitmap_set_bit (blocks, region->index);
++      bitmap_set_bit (beginning_of_block_p, region->index);
++      return true;
++    }
++  else
++    {
++      bool result
++	= get_real_entry_blocks_1 (region->region_info->basic_blocks_in_region,
++				   region->region_info->regions_in_region,
++				   region, blocks, beginning_of_block_p);
++      if (dump_file)
++	{
++	  fprintf (dump_file, "get_real_entry_blocks: region (%s)[%d] ",
++		   get_region_type_name (get_region_type (region)),
++		   region->index);
++	  bitmap_print (dump_file, 
++			region->region_info->basic_blocks_in_region,
++			"blocks (", ") ");
++	  bitmap_print (dump_file, 
++			region->region_info->regions_in_region,
++			"regions (", ")\n");
++	  if (result)
++	    {
++	      bitmap_iterator bi;
++	      unsigned int index;
++	      fprintf (dump_file, "entry blocks: ");
++	      EXECUTE_IF_SET_IN_BITMAP(blocks, 0, index, bi)
++		{
++		  fprintf (dump_file, " %d%s", 
++			   index, 
++			   bitmap_bit_p (beginning_of_block_p, index)?"^":"v");
++		}
++	      fprintf (dump_file, "\n");
++	    }
++	  else 
++	    fprintf (dump_file, "entry blocks failure!!!\n");
++	}
++      return result;
++    }
++}
++
++/* Get the set of real basic blocks (no region nodes are returned)
++   that can be used to insert code at the end of REGION.  The
++   indexes if those BLOCKS returned in a bitmap. The corresponding bit
++   in BEGINNING_OF_BLOCK_P is set if the proper insertion point is the
++   beginning of the block.  If false is returned, this function
++   failed.  This failure is generally because the region was either
++   the source or the target of abnormal edges that could not be
++   split.  */
++bool 
++get_real_exit_blocks (basic_block region, 
++		      bitmap blocks, 
++		      bitmap beginning_of_block_p)
++{
++  bitmap_clear (blocks);
++  bitmap_clear (beginning_of_block_p);
++  if (single_block_region_p (region))
++    {
++      bitmap_set_bit (blocks, region->index);
++      return true;
++    }
++  else
++    {
++      bool result 
++	= get_real_exit_blocks_1 (region->region_info->basic_blocks_in_region,
++				  region->region_info->regions_in_region,
++				  region, blocks, beginning_of_block_p);
++
++
++      if (dump_file)
++	{
++	  fprintf (dump_file, "get_real_exit_blocks: region (%s)[%d] ",
++		   get_region_type_name (get_region_type (region)),
++		   region->index);
++	  bitmap_print (dump_file, 
++			region->region_info->basic_blocks_in_region,
++			"blocks (", ") ");
++	  bitmap_print (dump_file, 
++			region->region_info->regions_in_region,
++			"regions (", ")\n");
++	  if (result)
++	    {
++	      bitmap_iterator bi;
++	      unsigned int index;
++	      fprintf (dump_file, "exit blocks: ");
++	      EXECUTE_IF_SET_IN_BITMAP(blocks, 0, index, bi)
++		{
++		  fprintf (dump_file, " %d%s", 
++			   index, 
++			   bitmap_bit_p (beginning_of_block_p, index)?"^":"v");
++		}
++	      fprintf (dump_file, "\n");
++	    }
++	  else 
++	    fprintf (dump_file, "exit blocks failure!!!\n");
++	}
++
++      return result;
++    }
++}
++
++/* Helper function for get_real_blocks.  Get all of the real basic
++   blocks in REGION and put their indexes in RESULT.  REGION must not
++   be a simple basic block. */
++static void
++get_real_blocks_1 (basic_block region, bitmap result)
++{
++  basic_block x;
++  FOR_EACH_BB_IN_REGION (x, region)
++    {
++      if (single_block_region_p (x))
++	bitmap_set_bit (result, x->index);
++      else
++	get_real_blocks_1 (x, result);
++    }
++}
++
++/* Get all of the real basic blocks in REGION and put their indexes in
++   RESULT.  */
++void
++get_real_blocks (basic_block region, bitmap result)
++{
++  bitmap_clear (result);
++  if (single_block_region_p (region))
++    bitmap_set_bit (result, region->index);
++  else
++    get_real_blocks_1 (region, result);
++}
++
++/* Debugging code. */
++static void
++dump_goto (basic_block target, char* s_indent)
++{
++  struct bb_temp *bb_info = (struct bb_temp *)target->aux;
++  if (bb_info)
++    fprintf (dump_file, "%s     goto %s(%dp)(%di)\n", s_indent,
++	     get_region_type_name (get_region_type (target)),
++	     bb_info->index, target->index);
++  else
++    fprintf (dump_file, "%s     goto %s(%d)\n", s_indent,
++	     get_region_type_name (get_region_type (target)), target->index);
++}
++
++/* Dump and list of arms of a switch statement.  All of the arms in
++   vec drop to the next arm except the last one that breaks.  */
++static void
++dump_case_list (basic_block * vec, int len, int indent, const char* tag)
++{
++  int i;
++  char *s_indent = (char *) alloca ((size_t) indent + 1);
++  int start;
++  bool something_falling = false;
++
++  memset ((void *) s_indent, ' ', (size_t) indent);
++  s_indent[indent] = '\0';
++
++  if (get_region_type (vec[0]) == COMPLEX_CASE_REGION)
++    start = 0;
++  else
++    {
++      something_falling = true;
++      start = 1;
++      fprintf (dump_file, "*%s  case\n", s_indent);
++      dump_recursive (vec[0], indent + 4);
++    }
++
++  for (i=start; i<len; i++)
++    {
++      region_details_u * crrd = vec[i]->region_info->region_details;
++      int count = crrd->complex_case_region.entry_case_count;
++      basic_block * entry_cases = crrd->complex_case_region.entry_cases;
++      basic_block case_region = crrd->complex_case_region.case_region;
++      int j;
++
++      for (j=0; j<count; j++)
++	{
++	  basic_block x = entry_cases[j];
++	  if (block_empty_p (x) && single_block_region_p (x))
++	    fprintf (dump_file, "*%s  case\n", s_indent);
++	  else
++	    {
++	      /* This block will be executed only when some code has
++		 actually been inserted into the critical block after
++		 the conditon.  */
++	      if (something_falling)
++		dump_goto (case_region, s_indent);
++	      fprintf (dump_file, "*%s  case\n", s_indent);
++	      dump_recursive (x, indent + 4);
++	    }
++	  something_falling = true;
++	}
++
++      /* Dump the actual code of the case.  */
++      dump_recursive (case_region, indent + 4);
++    }
++  /* Dump either return or break.  */
++  fprintf (dump_file, "*%s    %s;\n", s_indent, tag);
++}
++
++static void
++dump_recursive (basic_block rn, int indent)
++{
++  basic_block bb;
++  char *s_indent = (char *) alloca ((size_t) indent + 1);
++  enum region_type region_type = get_region_type (rn);
++  char *sep = (char*)"";
++  int i;
++  memset ((void *) s_indent, ' ', (size_t) indent);
++  s_indent[indent] = '\0';
++
++  fprintf (dump_file, "%s%s(%di)\n", s_indent,
++	   get_region_type_name (get_region_type (rn)), rn->index);
++  fprintf (dump_file, "%s  succs (", s_indent);
++  
++  for (i=0; i<rn->num_region_succs; i++)
++    {
++      basic_block y = rn->region_succs[i];
++      fprintf (dump_file, "%di ", y->index);
++    }
++  fprintf (dump_file, ") preds (");
++  
++  for (i=0; i<rn->num_region_preds; i++)
++    {
++      basic_block y = rn->region_preds[i];
++      fprintf (dump_file, "%di ", y->index);
++    }
++
++  if (region_type != SINGLE_NODE_REGION)
++    {
++      fprintf (dump_file, ") region (");
++      FOR_EACH_BB_IN_REGION(bb, rn)
++	{
++	  fprintf (dump_file, "%di ", bb->index);
++	}
++    }
++
++  fprintf (dump_file, ")\n");
++  
++/*   print_region_bb (dump_file, rn, s_indent); */
++
++  switch (region_type)
++    {
++    case SINGLE_NODE_REGION:
++      dump_bb (rn, dump_file, indent+2);
++      break;
++
++    case ROOT_REGION:
++    case IMPROPER_REGION:
++    case REDUCED_LOOP_REGION:
++    case BLOCK_REGION:
++
++      fprintf (dump_file, "%s  entry=(%di)\n", s_indent, 
++	       rn->region_info->region_head->index);
++      FOR_EACH_BB_IN_REGION(bb, rn)
++	{
++	  fprintf (dump_file, sep);
++	  dump_recursive (bb, indent+2);
++	  sep = (char*)"*\n";
++	}
++      break;
++
++    case IF_EXIT_ELSE_REGION:
++      dump_recursive (rn->region_info->region_head,
++		      indent+2);
++      fprintf (dump_file, "*%s  then\n", s_indent);
++      dump_goto (rn->region_info->region_details->if_exit_else_region.exit_region,
++		 s_indent);
++      fprintf (dump_file, "*%s  else\n", s_indent);
++      dump_recursive (rn->region_info->region_details->if_exit_else_region.else_region,
++		      indent+4);
++      break;
++
++    case IF_THEN_EXIT_REGION:
++      dump_recursive (rn->region_info->region_head,
++		      indent+2);
++      fprintf (dump_file, "*%s  then\n", s_indent);
++      dump_recursive (rn->region_info->region_details->if_then_exit_region.then_region,
++		      indent+4);
++      fprintf (dump_file, "*%s  else\n", s_indent);
++      dump_goto (rn->region_info->region_details->if_then_exit_region.exit_region,
++		 s_indent);
++      break;
++
++    case BRANCH2_EXIT_REGION:
++      dump_recursive (rn->region_info->region_head,
++		      indent+2);
++      fprintf (dump_file, "*%s  local\n", s_indent);
++      dump_recursive (rn->region_info->region_details->branch2_exit_region.local_region,
++		      indent+4);
++      dump_goto (rn->region_info->region_details->branch2_exit_region.exit_region,
++		 s_indent);
++
++      break;
++
++    case IF_THEN_ELSE_REGION:
++      dump_recursive (rn->region_info->region_head,
++		      indent+2);
++      fprintf (dump_file, "*%s  then\n", s_indent);
++      dump_recursive (rn->region_info->region_details->if_then_else_region.then_region,
++		      indent+4);
++      fprintf (dump_file, "*%s  else\n", s_indent);
++      dump_recursive (rn->region_info->region_details->if_then_else_region.else_region,
++		      indent+4);
++      break;
++
++    case DIAMOND_REGION:
++      dump_recursive (rn->region_info->region_head,
++		      indent+2);
++      fprintf (dump_file, "*%s  then\n", s_indent);
++      dump_recursive (rn->region_info->region_details->diamond_region.first_region,
++		      indent+4);
++      fprintf (dump_file, "*%s  else\n", s_indent);
++      dump_recursive (rn->region_info->region_details->diamond_region.second_region,
++		      indent+4);
++      break;
++
++    case COMPLEX_CASE_REGION:
++      gcc_assert (false);
++      break;
++	
++    case SWITCH_REGION:
++      dump_recursive (rn->region_info->region_head,
++		      indent+2);
++      {
++	unsigned int i;
++	region_details_u * rnrd = rn->region_info->region_details;
++	for (i=0; 
++	     i<rn->region_info->region_details->
++	       switch_region.exit_case_count;
++	     i++)
++	  {
++	    fprintf (dump_file, "*%s  case\n", s_indent);
++	    dump_goto (rnrd->switch_region.exit_cases[i],
++		       s_indent);
++	  }
++
++	for (i=0; i<rnrd->switch_region.return_case_count_count; i++)
++	  {
++	    basic_block* vec = rnrd->switch_region.return_cases[i];
++	    int len = rnrd->switch_region.return_case_counts[i];
++	    dump_case_list (vec, len, indent, "return");
++	  }
++
++	for (i=0; i<rnrd->switch_region.regular_case_count_count; i++)
++	  {
++	    basic_block* vec = rnrd->switch_region.regular_cases[i];
++	    int len = rnrd->switch_region.regular_case_counts[i];
++	    dump_case_list (vec, len, indent, "break");
++	  }
++      }
++      break;
++    default:
++      break;
++    }
++
++  if (!single_block_region_p (rn))
++    fprintf (dump_file, "%send %s\n", s_indent,
++	     get_region_type_name (get_region_type (rn)));
++}
++
++void
++dump_structure_graph (void)
++{
++   fprintf(dump_file, "*****structure tree for %s\n",
++	  lang_hooks.decl_printable_name (current_function_decl, 2));
++  if (ROOT_BLOCK_PTR)
++    dump_recursive (ROOT_BLOCK_PTR, 0);
++}
++
++static void
++print_region_bb (FILE * file, basic_block bb, const char * indent)
++{
++  struct bb_temp *bb_info = (struct bb_temp *)bb->aux;
++
++  fprintf (file, "%sbasic block=(%di)%p %s\n", indent,
++	   bb->index, (void*)bb,
++	   get_region_type_name (get_region_type (bb)));
++  if (bb_info)
++    {
++      if (bb_info->improper_head)
++	fprintf (file, "%simproper_head=%p\n", indent,
++		 (void*)bb_info->improper_head);
++      fprintf (file, "%sindex=(%dp), preord=%d, postord=%d, num_pred_in_set=%d, num_path=%d\n",
++	       indent, bb_info->index, bb_info->preord, bb_info->postord,
++	       bb_info->num_pred_in_set, bb_info->num_path);
++      if (bb_info->preds)
++	{
++	  fprintf (file, indent);
++	  bitmap_print (file, bb_info->preds, "preds ", "\n");
++	}
++      if (bb_info->succs)
++	{
++	  fprintf (file, indent);
++	  bitmap_print (file, bb_info->succs, "succs ", "\n");
++	}
++      if (bb_info->visible_preds)
++	{
++	  fprintf (file, indent);
++	  bitmap_print (file, bb_info->visible_preds, "visible preds ", "\n");
++	}
++      if (bb_info->succs)
++	{
++	  fprintf (file, indent);
++	  bitmap_print (file, bb_info->visible_succs, "visible succs ", "\n");
++	}
++      if (bb_info->improper_nodes)
++	{
++	  fprintf (file, indent);
++	  bitmap_print (file, bb_info->improper_nodes, "improper nodes ", "\n");
++	}
++      if (bb_info->blocks_in_region)
++	{
++	  fprintf (file, indent);
++	  bitmap_print (file, bb_info->blocks_in_region, "blocks in region ", "\n");
++	}
++    }
++  else
++    fprintf (file, "\n");
++
++  if (visible_nodes)
++    {
++      fprintf (file, indent);
++      bitmap_print (file, visible_nodes, "visible_nodes ", "\n");
++    }
++}
++
++void
++debug_region_bb (basic_block bb)
++{
++  print_region_bb (stderr, bb, "");
++}
+Index: rtl.h
+===================================================================
+RCS file: /cvs/gcc/gcc/gcc/rtl.h,v
+retrieving revision 1.560
+diff -u -p -r1.560 rtl.h
+--- rtl.h	6 Sep 2005 08:52:51 -0000	1.560
++++ rtl.h	29 Sep 2005 22:15:57 -0000
+@@ -1998,6 +1998,7 @@ extern void print_mem_expr (FILE *, tree
+ extern void print_rtl (FILE *, rtx);
+ extern void print_simple_rtl (FILE *, rtx);
+ extern int print_rtl_single (FILE *, rtx);
++extern int print_rtl_single_with_indent (FILE *, rtx, int);
+ extern void print_inline_rtx (FILE *, rtx, int);
+ 
+ /* In loop.c */
+Index: tree-cfg.c
+===================================================================
+RCS file: /cvs/gcc/gcc/gcc/tree-cfg.c,v
+retrieving revision 2.221
+diff -u -p -r2.221 tree-cfg.c
+--- tree-cfg.c	13 Sep 2005 07:33:49 -0000	2.221
++++ tree-cfg.c	29 Sep 2005 22:16:00 -0000
+@@ -4138,7 +4141,51 @@ tree_move_block_after (basic_block bb, b
+   return true;
+ }
+ 
++/* Return true if BB contains only labels or non-executable
++   instructions.  */ // STEVEN: now we already have empty_block_p
+ 
++static bool
++tree_block_empty_p (basic_block bb)
++{
++  block_stmt_iterator bsi;
++  for (bsi = bsi_start (bb); !bsi_end_p (bsi); bsi_next (&bsi))
++    {
++      tree stmt = bsi_stmt (bsi);
++      if ((TREE_CODE (stmt) != LABEL_EXPR)
++	  && (TREE_CODE (stmt) != GOTO_EXPR))
++	return false;
++    }
++  return true;
++}
++      
++/* Split a basic block if it ends with a conditional branch and if the
++   other part of the block is not empty.  */
++
++static basic_block
++tree_split_block_before_cond_jump (basic_block bb)
++{
++  tree split_point = NULL;
++  tree last = NULL;
++  bool found_code = false;
++
++  block_stmt_iterator bsi;
++  for (bsi = bsi_start (bb); !bsi_end_p (bsi); bsi_next (&bsi))
++    {
++      tree stmt = bsi_stmt (bsi);
++      if ((TREE_CODE (stmt) == COND_EXPR)
++	  || (TREE_CODE (stmt) == SWITCH_EXPR))
++	split_point = last;
++      else if (TREE_CODE (stmt) != LABEL_EXPR) 
++	found_code = true;
++      last = stmt;
++    }
++
++  if (found_code && split_point)
++    return split_block (bb, split_point)->dest;
++  else 
++    return NULL;
++}
++      
+ /* Return true if basic_block can be duplicated.  */
+ 
+ static bool
+@@ -4959,7 +5006,9 @@ struct cfg_hooks tree_cfg_hooks = {
+   tree_lv_add_condition_to_bb, /* lv_add_condition_to_bb */
+   tree_lv_adjust_loop_header_phi, /* lv_adjust_loop_header_phi*/
+   extract_true_false_edges_from_block, /* extract_cond_bb_edges */
+-  flush_pending_stmts 		/* flush_pending_stmts */  
++  flush_pending_stmts, 		/* flush_pending_stmts */  
++  tree_block_empty_p,           /* block_empty_p */
++  tree_split_block_before_cond_jump, /* split_block_before_cond_jump */
+ };
+ 
+ 
