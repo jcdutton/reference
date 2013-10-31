@@ -16,6 +16,10 @@ I1 - I2 = Integer
 I1 * I2 = Integer
 I1 / I2 = Integer
 
++  can be P1 + I1, I1 + I2
+-  can be P1 - P2, P1 - I1, I1 - I2
+*  can be I1 * I2
+/  can be I1 / I2
 
 1) A variable is a pointer if it is used to load/store another variable in memory.
 2) Signed/Unsigned integer can be determined from branch statements and other hints.
