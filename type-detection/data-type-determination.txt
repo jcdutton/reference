@@ -76,6 +76,7 @@ Next, these new ones are executed.
 repeat until no new ones can be add to the context.
 
 If when executing the rules, a type is changed, e.g. 32bit goes to 64bit. Then need to modify the instruction stream with bitcasts etc. and re-run the analysis.
+If a bitcast is done, retain the bitcast relationship so if a bitcast is needed later on, the same one can be utilised.
 
 The final check is the then run all the rules, and verify that they are all valid.
 Each rule has several expressions.
