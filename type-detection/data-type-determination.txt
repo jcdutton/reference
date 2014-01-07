@@ -48,7 +48,7 @@ Rules:
 1) If one valueA-instruction is a LOAD/STORE so the type is clear, all other valueA-instructions have the same type, so you can raise them to the top of the graph.
 2) A sanity check needs to be made so that all valueA-instructions have the same type.
 3) Links between nodes are based on instructions. So, an instruction with 3 params will have 1 node at the top, and 2 nodes below it, with links.
-But then the next nodes below those will be the previous nodes above them. So, do we then have triange graph links?
+But then the next nodes below those will be the previous nodes above them. So, do we then have triangle graph links?
 4) If one of the nodes below is a top node, A horizontal or upwards link is used.
 5) Also need another link type for different instructions of the same value.
 6) Need to work out if order of instructions affects the type?
@@ -64,6 +64,7 @@ Sometimes, an inheritance is inferred only from a combination of more than one n
 So, a new node type is needed, a descision node, which combines more than one link into a single link.
 Also, a node that is just the "value" with the links determining the type of the value.
 
+IDEA 3: Type Inference Propagation
 Alternatively, create a long list of "if (...) then ..." statements, and then try to solve them.
 Need a way to resolve circular statements.
 
@@ -77,8 +78,17 @@ repeat until no new ones can be add to the context.
 
 If when executing the rules, a type is changed, e.g. 32bit goes to 64bit. Then need to modify the instruction stream with bitcasts etc. and re-run the analysis.
 If a bitcast is done, retain the bitcast relationship so if a bitcast is needed later on, the same one can be utilised.
+If a bitcase is added, the types on all the affected instructions could be reset to unknown, and then the rules can be run again on those instructions
+in order to gain type information. This area is difficult because we don't know exactly how to unwide the previous induction steps.
+So, we don't know which instructons have been used to make the type inductions, so we will not know if the changed instructions previously contributed to
+the type induction.
+Adding a bitcase instruction might modify the SSA labeling. A label would be split in 2. The label up until the new bitcast would be the same.
+The label after the bitcast would be new.
+The reason to add the bitcast instruction is due to the immediately following instruction needing it. So, with this pairing in mind, we can limit the amount
+of instructions that might have contributed to the induction.
 
-The final check is the then run all the rules, and verify that they are all valid.
+
+The final check is to then run all the rules, and verify that they are all valid.
 Each rule has several expressions.
 One expression to decide to include the rule or not in the context. (e.g. If value1 and value2 defined, and value3 undefined.)
 One expression to validate the input data. (e.g. if value1 == ptr and value2 == int)
