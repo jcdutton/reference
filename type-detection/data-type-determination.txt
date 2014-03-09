@@ -3,6 +3,7 @@ IDEAS regarding data type determination.
 P1,P2 are pointers
 I1,I2 are integers
 
+OP1  OP2
 P1 + P2 = Invalid
 P1 - P2 = Integer
 P1 * P2 = Invalid
@@ -18,7 +19,12 @@ I1 - I2 = Integer
 I1 * I2 = Integer
 I1 / I2 = Integer
 
-+  can be P1 + I1, I1 + I2
+I1 + P1 = Pointer
+I1 - P1 = Invalid
+I1 * P1 = Invalid
+I1 / P1 = Invalid
+
++  can be P1 + I1, I1 + P1, I1 + I2
 -  can be P1 - P2, P1 - I1, I1 - I2
 *  can be I1 * I2
 /  can be I1 / I2
@@ -41,7 +47,7 @@ One of the instructions caused the creation of the SSA value.
 The rest of the instructions used the value.
 
 The problem is how to link these value-instruction nodes ?
-Investigate a rule that type inferance inherits only from above.
+Investigate a rule that type inference inherits only from above.
 Can you arrange the nodes so this works.
 
 Rules:
@@ -61,7 +67,7 @@ Maybe Use a scatter diagram.
 Each node is a value-instruction.
 Each link between the nodes infers inheritance in the link direction.
 Sometimes, an inheritance is inferred only from a combination of more than one node.
-So, a new node type is needed, a descision node, which combines more than one link into a single link.
+So, a new node type is needed, a decision node, which combines more than one link into a single link.
 Also, a node that is just the "value" with the links determining the type of the value.
 
 IDEA 3: Type Inference Propagation
@@ -78,11 +84,11 @@ repeat until no new ones can be add to the context.
 
 If when executing the rules, a type is changed, e.g. 32bit goes to 64bit. Then need to modify the instruction stream with bitcasts etc. and re-run the analysis.
 If a bitcast is done, retain the bitcast relationship so if a bitcast is needed later on, the same one can be utilised.
-If a bitcase is added, the types on all the affected instructions could be reset to unknown, and then the rules can be run again on those instructions
-in order to gain type information. This area is difficult because we don't know exactly how to unwide the previous induction steps.
-So, we don't know which instructons have been used to make the type inductions, so we will not know if the changed instructions previously contributed to
+If a bitcast is added, the types on all the affected instructions could be reset to unknown, and then the rules can be run again on those instructions
+in order to gain type information. This area is difficult because we don't know exactly how to unwind the previous induction steps.
+So, we don't know which instructions have been used to make the type inductions, so we will not know if the changed instructions previously contributed to
 the type induction.
-Adding a bitcase instruction might modify the SSA labeling. A label would be split in 2. The label up until the new bitcast would be the same.
+Adding a bitcast instruction might modify the SSA labeling. A label would be split in 2. The label up until the new bitcast would be the same.
 The label after the bitcast would be new.
 The reason to add the bitcast instruction is due to the immediately following instruction needing it. So, with this pairing in mind, we can limit the amount
 of instructions that might have contributed to the induction.
@@ -95,4 +101,85 @@ One expression to validate the input data. (e.g. if value1 == ptr and value2 == 
 One expression to update the type data, or use to check the type data. (e.g. value3 == ptr.)
 Maybe add negative rules, I.e. for a MUL expression, if either of the values are ptr, abort. or do ptr_to_int casts.
 
+Implementation:
+1) Add structure to the labal_s struct.
+add to the label_s structure a list/array containing all the instructions that reference this label.
+The list would be an array of structs. This can probably be filled in
+by adding functionality to the "register_label()" function.
+For each instruction in the list, we would have:
+struct tip_s {
+int valid;  /* Is this entry valid? More use for when we need to
+delete individual entries */
+int inst_number; /* Number of the inst_log entry */
+int operand; /* Which operand of the instruction? 1 = srcA/value1, 2 =
+srcB/value2, 3 = dstA/value3 */
+int lab_pointer_first;  /* Is this a pointer */
+int lab_pointer_inferred;
+int size_bits_first;
+int size_bits_inferred;
+int lab_pointer_size_first;
+int lab_pointer_size_inferred;
+}
+
+So, for each label we now have a list of each instruction it appears in.
+The contents of the structure are then filled with what type
+information can be gained from this instruction for this label.
+
+Each variable in the structure have values:
+0 = no known,
+1 or more = valid value
+
+The "first" and "inferred" depends on how the type was discovered.
+"first" is used when we are 100% sure about the type.
+"inferred" is used when the type has been inferred based on the type
+of some other label.
+
+Once that array is set up for each label, the next stage is to fill
+the entries in.
+One would do a first pass of all the instructions, and fill in the
+"first" values where possible.
+One would then start doing passes to fill in the inferred ones.
+
+2)
+Then build a dependency tree.
+So, instead of one label being links to each of the instructions it is used in,
+create a dependency tree of just the dependency between the labels.
+I.e. label A's type depends in some way on label B.
+Each dependency link will have a rule.
+Rules can be:
+label A's type IS_THE_SAME_AS label B's type. IS_THE_SAME_AS could be bi-directional, but we need to get to a DAG, so make in uni-directional.
+	but the direction to choose is difficult. The node furthest from the "first values" node depends on the closer one.
+	i.e. the deepest one depends on the closer one.
+	If they are equal depth, then which direction to choose ?
+labal A is type X IF label B is type X and label C is type X. This is tri-directional because it is the same as:
+labal B is type X IF label A is type X and label C is type X.
+labal C is type X IF label A is type X and label B is type X.
+	We need some way to determine which dependencies to suppress in order to get to a DAG.
+	Use deepest one depends on the closer one.
+	If they are equal depth, then which ones of the 3 to choose ?
+
+We can have a first set of rules to determine if a label is a pointer or not.
+The second set would deal with the bit width of each label.
+
+3)
+There exists a problem in that there might be conflicts in the types, with 
+e.g. one dependency telling us it is 32bits and another telling us it is 64bits.
+These are resolved by adding bitcasts, truncates instructions etc.
+The problem is when an instruction is added, the labels change, and thus the dependencies change.
+
+4a)
+There exists a problem in that there might be circular dependencies.
+We need some way to ensure we end up with a DAG. i.e. Acyclic.
+Can we tell if it is acyclic even before we have inferred the types?
+
+You can check for cycles in a connected component of a graph as follows.
+Find a node which has only outgoing edges. If there is no such node, then there is a cycle.
+Start a DFS at that node. When traversing each edge, check whether the edge points back to a node already on your stack. This indicates the existence of a cycle. If you find no such edge, there are no cycles in that connected component.
+Repeat for each node which has only outgoing edges.
+
+4b)
+If cycles are found, what can be done to break them?
+a) If the dependency from both directions gives us the same type, then we can temporarily block one of the dependencies.
+b) If the dependency causes the type to wish to be different depending on which dependency we use,
+then new bitcast, truncate instructions need to be added, creating a new label and the dependency graph adjusted to include them.
 
