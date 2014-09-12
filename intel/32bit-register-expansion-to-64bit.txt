@@ -1,0 +1,4 @@
+In Intel X86_64 bit mode:
+32-bit operands generate a 32-bit result, zero-extended to a 64-bit result in the destination general-purpose register.
+So, MOV EAX, EBX causes the upper 32-bits of EBX to be zeroed.
+
