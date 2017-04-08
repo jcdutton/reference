@@ -183,3 +183,13 @@ a) If the dependency from both directions gives us the same type, then we can te
 b) If the dependency causes the type to wish to be different depending on which dependency we use,
 then new bitcast, truncate instructions need to be added, creating a new label and the dependency graph adjusted to include them.
 
+
+NEW INFO:
+We need to store types:
+Int
+Pointer to Int
+Pointer to Pointer
+
+Then score direct, then score indirect (the Int bit of "pointer to Int").
+
+
