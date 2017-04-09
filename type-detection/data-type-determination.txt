@@ -64,6 +64,8 @@ But then the next nodes below those will be the previous nodes above them. So, d
 Each value has two properties:
 1) Pointer or Int
 2) size
+Note: (1) Pointer of Int is wrong. We instead need the type of pointer.
+
 
 Maybe Use a scatter diagram.
 Each node is a value-instruction.
@@ -188,10 +190,54 @@ then new bitcast, truncate instructions need to be added, creating a new label a
 
 NEW INFO:
 We need to store types:
+Type. e.g. Int
+Pointer to Type
+Pointer to Pointer
+Pointer to Pointer to int  etc.
+
+Simplistically this can be, for now, taken as:
 Int
 Pointer to Int
-Pointer to Pointer
+Pointer to Pointer.
+
 
 Then score direct, then score indirect (the Int bit of "pointer to Int").
+
+struct tip_s {
+	int valid;  /* Is this entry valid? More use for when we need to delete individual entries */
+	int node;   /* The node that the inst or phi is contained in */
+	int inst_number; /* Number of the inst_log entry */
+	int phi_number; /* Number of the phi */
+	int operand; /* Which operand of the instruction? 1 = srcA/value1, 2 = srcB/value2, 3 = dstA/value3 */
+	int lab_pointer_first;  /* Is this a pointer. Determined from the LOAD or STORE command */
+	int lab_pointed_to_size; /* Is the size of the pointed to value */
+	int lab_pointer_inferred; /* This has been inferred from another label. */
+	struct tip_s *tip; /* Add a pointer to the pointed to type. */
+	struct tip_s *tip_up; /* Add a pointer to the tip that pointed to this. */
+	int lab_size_first; /* Bit width of the label */
+	int lab_size_inferred;
+	int lab_integer_first;
+	int lab_unsigned_integer_first;
+	int lab_signed_integer_first;
+};
+
+Type inferance can get complicated.
+E.g. See the following code:
+
+ADD A + B = C
+STORE 2 in [C]
+
+We therefore know C is a Pointer.
+From the rules:
+P1 + P2 = Invalid
+P1 + I1 = Pointer
+This means, either:
+A = Pointer
+B = Integer
+or
+A = Integer
+B = Pointer
+
+How to represent this in the types?
 
 
