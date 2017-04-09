@@ -240,4 +240,44 @@ B = Pointer
 
 How to represent this in the types?
 
+What identifies a pointer?
+A STORE or LOAD determines that it is a pointer and what size the value is being stored.
+What idenfifies an intenger?
+Signed/Unsigned integer can be determined from branch statements and other hints.
+What are the other hints?
+I am not sure a branch can determine that. One could compare two pointer, so see if we had reached a malloc limit.
+A signed compare would probably force the type to be a signed int, and not a pointer.
+
+Integer or String can be determined depending on how it is used.
+E.g. If it is used as the format variable in a printf() it is a string.
+If it is used in the variable args of a printf() statement and the format string identifies it as %s is it a string.
+
+What about code that has:
+value1 + value2 + value3
+
+E.g. Instructions could look like:
+result = value1
+result = result + value2
+result = result + value3
+return result
+
+is result an integer or a pointer?
+Assume value1 is a pointer, what happens?
+value2 and value3 must be integers.
+Assume value1 is an integer, what happens?
+If value2 is a pointer, value3 must be an int.
+If value3 is a pointer, value2 must be an int.
+If value2 is a int, value3 may also be an int.
+Note: This is starting to become difficult!!!
+
+What can tell us that something is an int and not a pointer?
+1) A signed calculation or compare means it is an integer.
+2) The integer part of a addition, with the other part known to be a pointer.
+3) 
+P1 - P2 = Integer
+I1 + I2 = Integer
+I1 - I2 = Integer
+I1 * I2 = Integer
+I1 / I2 = Integer
+
 
