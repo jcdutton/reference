@@ -2,3 +2,7 @@ In Intel X86_64 bit mode:
 32-bit operands generate a 32-bit result, zero-extended to a 64-bit result in the destination general-purpose register.
 So, MOV EAX, EBX causes the upper 32-bits of EBX to be zeroed.
 
+For ADDL,  the result is always 32bits, with the higher 64 bits all zero.
+ADDL: 0xffffffff + 0x22 = 0x21        32bit
+ADDQ: 0xffffffff + 0x22 = 0x100000021 64bit
+
